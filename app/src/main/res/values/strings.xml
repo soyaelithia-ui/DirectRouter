@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DirectRouter</string>
+
+    <!-- Navigation -->
+    <string name="nav_router">Router</string>
+    <string name="nav_client_vpn">Cliente VPN</string>
+    <string name="nav_settings">Ajustes</string>
+
+    <!-- Host / Router -->
+    <string name="host_title">Router Wi-Fi Direct</string>
+    <string name="host_power_on">Encender</string>
+    <string name="host_power_off">Apagar</string>
+    <string name="host_starting">Iniciando…</string>
+    <string name="host_status_running">Activo</string>
+    <string name="host_status_stopped">Detenido</string>
+    <string name="host_status_error">Error</string>
+    <string name="host_credentials_title">Credenciales Wi-Fi Direct y Proxy</string>
+    <string name="host_ssid_label">SSID</string>
+    <string name="host_passphrase_label">Contraseña</string>
+    <string name="host_ip_label">IP del Proxy</string>
+    <string name="host_port_label">Puerto</string>
+    <string name="host_show_qr">Mostrar código QR Wi-Fi</string>
+    <string name="host_qr_dialog_title">Conectar por QR Wi-Fi</string>
+    <string name="host_qr_dialog_hint">Escanea este código desde otro teléfono para conectarte al Wi-Fi Direct.</string>
+    <string name="host_manual_guide_title">Conectar sin instalar app (Proxy Manual)</string>
+    <string name="host_manual_guide_body">1. Conecta el otro dispositivo a la red Wi-Fi indicada.\n2. En Ajustes Wi-Fi del dispositivo cliente, elige Proxy Manual.\n3. Introduce la IP y el Puerto mostrados arriba.</string>
+    <string name="host_stats_title">Estadísticas en tiempo real</string>
+    <string name="host_download_speed">Descarga</string>
+    <string name="host_upload_speed">Subida</string>
+    <string name="host_total_transferred">Transferido</string>
+    <string name="host_active_connections">Conexiones activas</string>
+    <string name="host_wifi_clients">Clientes Wi-Fi</string>
+    <string name="host_uptime">Tiempo activo</string>
+
+    <!-- Client VPN -->
+    <string name="client_title">Cliente VPN (2.º teléfono)</string>
+    <string name="client_subtitle">Enruta todo el tráfico (TCP, UDP y DNS) hacia el proxy SOCKS5 del Host.</string>
+    <string name="client_connect">Conectar VPN</string>
+    <string name="client_disconnect">Desconectar</string>
+    <string name="client_host_ip">IP del Host</string>
+    <string name="client_host_port">Puerto del Host</string>
+    <string name="client_test_connection">Probar conexión</string>
+    <string name="client_wifi_connected">Wi-Fi conectado</string>
+    <string name="client_wifi_disconnected">Sin Wi-Fi</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Ajustes</string>
+    <string name="settings_proxy_port">Puerto del proxy</string>
+    <string name="settings_ssid_suffix">Sufijo SSID</string>
+    <string name="settings_passphrase">Contraseña fija</string>
+    <string name="settings_generate_passphrase">Generar nueva</string>
+    <string name="settings_wifi_band">Banda Wi-Fi</string>
+    <string name="settings_band_auto">Automática</string>
+    <string name="settings_band_2ghz">2.4 GHz</string>
+    <string name="settings_band_5ghz">5 GHz</string>
+    <string name="settings_keep_cpu_awake">Mantener CPU activa (WakeLock)</string>
+    <string name="settings_battery_optimization">Optimización de batería</string>
+    <string name="settings_save">Guardar</string>
+
+    <!-- Notifications & Actions -->
+    <string name="notif_host_channel_name">Servicio Router Wi-Fi Direct</string>
+    <string name="notif_host_title">DirectRouter activo</string>
+    <string name="notif_host_action_stop">Apagar</string>
+    <string name="notif_vpn_channel_name">Cliente VPN DirectRouter</string>
+    <string name="notif_vpn_title">Túnel VPN activo</string>
+    <string name="notif_vpn_action_disconnect">Desconectar</string>
+    <string name="action_copy">Copiar</string>
+    <string name="action_close">Cerrar</string>
+</resources>

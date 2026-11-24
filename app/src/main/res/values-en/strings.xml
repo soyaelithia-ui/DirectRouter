@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DirectRouter</string>
+
+    <!-- Navigation -->
+    <string name="nav_router">Router</string>
+    <string name="nav_client_vpn">VPN Client</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- Host / Router -->
+    <string name="host_title">Wi-Fi Direct Router</string>
+    <string name="host_power_on">Turn On</string>
+    <string name="host_power_off">Turn Off</string>
+    <string name="host_starting">Starting…</string>
+    <string name="host_status_running">Running</string>
+    <string name="host_status_stopped">Stopped</string>
+    <string name="host_status_error">Error</string>
+    <string name="host_credentials_title">Wi-Fi Direct &amp; Proxy Credentials</string>
+    <string name="host_ssid_label">SSID</string>
+    <string name="host_passphrase_label">Passphrase</string>
+    <string name="host_ip_label">Proxy IP</string>
+    <string name="host_port_label">Port</string>
+    <string name="host_show_qr">Show Wi-Fi QR Code</string>
+    <string name="host_qr_dialog_title">Connect via Wi-Fi QR</string>
+    <string name="host_qr_dialog_hint">Scan this code from another phone to join the Wi-Fi Direct network.</string>
+    <string name="host_manual_guide_title">Connect without an app (Manual Proxy)</string>
+    <string name="host_manual_guide_body">1. Connect the other device to the Wi-Fi network shown above.\n2. Open Wi-Fi settings on the client device and set Manual Proxy.\n3. Enter the Proxy IP and Port shown above.</string>
+    <string name="host_stats_title">Live Traffic Statistics</string>
+    <string name="host_download_speed">Download</string>
+    <string name="host_upload_speed">Upload</string>
+    <string name="host_total_transferred">Transferred</string>
+    <string name="host_active_connections">Active Connections</string>
+    <string name="host_wifi_clients">Wi-Fi Clients</string>
+    <string name="host_uptime">Uptime</string>
+
+    <!-- Client VPN -->
+    <string name="client_title">VPN Client (2nd Phone)</string>
+    <string name="client_subtitle">Routes all device traffic (TCP, UDP, DNS) through the Host SOCKS5 proxy.</string>
+    <string name="client_connect">Connect VPN</string>
+    <string name="client_disconnect">Disconnect</string>
+    <string name="client_host_ip">Host IP</string>
+    <string name="client_host_port">Host Port</string>
+    <string name="client_test_connection">Test Connection</string>
+    <string name="client_wifi_connected">Wi-Fi Connected</string>
+    <string name="client_wifi_disconnected">No Wi-Fi</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_proxy_port">Proxy Port</string>
+    <string name="settings_ssid_suffix">SSID Suffix</string>
+    <string name="settings_passphrase">Fixed Passphrase</string>
+    <string name="settings_generate_passphrase">Generate New</string>
+    <string name="settings_wifi_band">Wi-Fi Band</string>
+    <string name="settings_band_auto">Auto</string>
+    <string name="settings_band_2ghz">2.4 GHz</string>
+    <string name="settings_band_5ghz">5 GHz</string>
+    <string name="settings_keep_cpu_awake">Keep CPU Awake (WakeLock)</string>
+    <string name="settings_battery_optimization">Battery Optimization</string>
+    <string name="settings_save">Save</string>
+
+    <!-- Notifications & Actions -->
+    <string name="notif_host_channel_name">Wi-Fi Direct Router Service</string>
+    <string name="notif_host_title">DirectRouter Active</string>
+    <string name="notif_host_action_stop">Turn Off</string>
+    <string name="notif_vpn_channel_name">DirectRouter VPN Client</string>
+    <string name="notif_vpn_title">VPN Tunnel Active</string>
+    <string name="notif_vpn_action_disconnect">Disconnect</string>
+    <string name="action_copy">Copy</string>
+    <string name="action_close">Close</string>
+</resources>
