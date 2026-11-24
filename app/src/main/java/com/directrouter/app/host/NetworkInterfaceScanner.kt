@@ -1,6 +1,8 @@
 package com.directrouter.app.host
 
+import com.directrouter.app.data.ValidationUtils
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.NetworkInterface
 import java.util.Locale
 
@@ -87,6 +89,85 @@ object NetworkInterfaceScanner {
                 ),
             )
             .distinctBy { it.ipAddress }
+    }
+
+    fun isActiveLocalIpv4(ip: String): Boolean {
+        if (!ValidationUtils.isStrictIpv4(ip)) return false
+        val interfaces = try {
+            NetworkInterface.getNetworkInterfaces()
+        } catch (_: Exception) {
+            null
+        } ?: return false
+
+        while (interfaces.hasMoreElements()) {
+            val iface = try {
+                interfaces.nextElement()
+            } catch (_: Exception) {
+                continue
+            }
+            val isUpAndNonLoopback = try {
+                iface.isUp && !iface.isLoopback
+            } catch (_: Exception) {
+                false
+            }
+            if (!isUpAndNonLoopback) continue
+
+            val addresses = try {
+                iface.inetAddresses
+            } catch (_: Exception) {
+                continue
+            }
+
+            while (addresses.hasMoreElements()) {
+                val addr = addresses.nextElement() as? Inet4Address ?: continue
+                if (addr.isLoopbackAddress || addr.isAnyLocalAddress) continue
+                if (addr.hostAddress == ip) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    fun getAllLocalInetAddresses(): Set<InetAddress> {
+        val result = LinkedHashSet<InetAddress>()
+        val interfaces = try {
+            NetworkInterface.getNetworkInterfaces()
+        } catch (_: Exception) {
+            null
+        } ?: return emptySet()
+
+        while (interfaces.hasMoreElements()) {
+            val iface = try {
+                interfaces.nextElement()
+            } catch (_: Exception) {
+                continue
+            }
+            val isUp = try {
+                iface.isUp
+            } catch (_: Exception) {
+                false
+            }
+            if (!isUp) continue
+
+            val addresses = try {
+                iface.inetAddresses
+            } catch (_: Exception) {
+                continue
+            }
+
+            while (addresses.hasMoreElements()) {
+                val addr = try {
+                    addresses.nextElement()
+                } catch (_: Exception) {
+                    continue
+                }
+                if (!addr.isAnyLocalAddress) {
+                    result.add(addr)
+                }
+            }
+        }
+        return result
     }
 
     private fun classifyPriority(normalizedName: String, address: Inet4Address): Int? {

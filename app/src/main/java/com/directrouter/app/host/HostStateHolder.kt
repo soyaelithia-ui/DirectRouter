@@ -25,6 +25,11 @@ data class HostServiceState(
     val errorMessage: String? = null,
     val shareMode: HostShareMode = HostShareMode.WIFI_DIRECT,
     val localIpAddresses: List<String> = emptyList(),
+    val boundAddress: String = "",
+    val isBoundAllInterfaces: Boolean = false,
+    val isProxyAuthEnabled: Boolean = false,
+    val isAntiSsrfEnabled: Boolean = true,
+    val maxConnections: Int = 256,
 ) {
     val pacUrl: String
         get() = "http://${ipAddress.ifBlank { "192.168.49.1" }}:$port/proxy.pac"

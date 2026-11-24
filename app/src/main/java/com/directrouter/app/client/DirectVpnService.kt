@@ -20,6 +20,8 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.directrouter.app.DirectRouterApp
+import com.directrouter.app.R
+import com.directrouter.app.data.RouterSettings
 import com.directrouter.app.host.ServiceStatus
 import java.io.File
 import java.io.IOException
@@ -32,6 +34,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -47,16 +50,26 @@ class DirectVpnService : VpnService() {
 
     private var tunInterface: ParcelFileDescriptor? = null
     private var tunnelThread: Thread? = null
+    private var settingsJob: Job? = null
     private var connectJob: Job? = null
     private var statsJob: Job? = null
 
     private val stopping = AtomicBoolean(false)
+    @Volatile
+    private var currentSettings: RouterSettings = RouterSettings()
+
     private var lastNotificationUpdateMs: Long = 0L
+    private var lastRxBytesSample: Long = 0L
+    private var lastTxBytesSample: Long = 0L
+    private var lastStatsSampleMs: Long = 0L
+    private var currentRxBytesPerSec: Long = 0L
+    private var currentTxBytesPerSec: Long = 0L
 
     override fun onCreate() {
         super.onCreate()
         connectivityManager = getSystemService(ConnectivityManager::class.java)
         createNotificationChannel()
+        startSettingsObservation()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -71,11 +84,14 @@ class DirectVpnService : VpnService() {
                     buildNotification(
                         title = "DirectRouter VPN",
                         text = "Conectando túnel VPN...",
+                        settings = currentSettings,
                     ),
                 )
                 val requestedIp = intent?.getStringExtra(EXTRA_HOST_IP)
                 val requestedPort = intent?.getIntExtra(EXTRA_HOST_PORT, -1) ?: -1
-                startVpn(requestedIp, requestedPort)
+                val requestedAuthUser = intent?.getStringExtra(EXTRA_AUTH_USERNAME)
+                val requestedAuthPass = intent?.getStringExtra(EXTRA_AUTH_PASSWORD)
+                startVpn(requestedIp, requestedPort, requestedAuthUser, requestedAuthPass)
                 return START_STICKY
             }
 
@@ -90,30 +106,76 @@ class DirectVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        settingsJob?.cancel()
+        settingsJob = null
         val preserveError = ClientVpnStateHolder.state.value.status == ServiceStatus.ERROR
         teardownVpn(preserveError = preserveError)
         serviceScope.cancel()
         super.onDestroy()
     }
 
-    private fun startVpn(requestedIp: String?, requestedPort: Int) {
+    private fun startSettingsObservation() {
+        settingsJob?.cancel()
+        val app = application as DirectRouterApp
+        settingsJob = serviceScope.launch {
+            app.settingsRepository.settingsFlow.collectLatest { newSettings ->
+                val prev = currentSettings
+                currentSettings = newSettings
+                val notifChanged =
+                    prev.notifPrivacyMode != newSettings.notifPrivacyMode ||
+                        prev.notifShowLiveSpeed != newSettings.notifShowLiveSpeed ||
+                        prev.notifShowStopAction != newSettings.notifShowStopAction
+                if (notifChanged) {
+                    val status = ClientVpnStateHolder.state.value.status
+                    if (status == ServiceStatus.RUNNING || status == ServiceStatus.STARTING) {
+                        updateNotification(force = true)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun startVpn(
+        requestedIp: String?,
+        requestedPort: Int,
+        requestedAuthUser: String?,
+        requestedAuthPass: String?,
+    ) {
         val currentStatus = ClientVpnStateHolder.state.value.status
         if (currentStatus == ServiceStatus.STARTING || currentStatus == ServiceStatus.RUNNING) {
             return
         }
 
         stopping.set(false)
+        lastRxBytesSample = 0L
+        lastTxBytesSample = 0L
+        lastStatsSampleMs = 0L
+        currentRxBytesPerSec = 0L
+        currentTxBytesPerSec = 0L
+
         connectJob?.cancel()
         connectJob = serviceScope.launch {
             try {
                 val app = application as DirectRouterApp
                 val savedSettings = app.settingsRepository.getCurrentSettings()
+                currentSettings = savedSettings
+
                 val hostIp = requestedIp?.trim()?.takeIf { it.isNotEmpty() }
                     ?: savedSettings.clientHostIp.trim().ifEmpty { DEFAULT_HOST_IP }
                 val hostPort = if (requestedPort in 1..65535) {
                     requestedPort
                 } else {
                     savedSettings.clientHostPort
+                }
+
+                val authUsername: String
+                val authPassword: String
+                if (requestedAuthPass != null) {
+                    authUsername = requestedAuthUser.orEmpty()
+                    authPassword = requestedAuthPass
+                } else {
+                    authUsername = savedSettings.clientAuthUsername
+                    authPassword = savedSettings.clientAuthPassword
                 }
 
                 val initialWifi = findActiveWifiNetwork()
@@ -130,6 +192,7 @@ class DirectVpnService : VpnService() {
                         errorMessage = null,
                     )
                 }
+                updateNotification(force = true)
 
                 val wifiReadyDeferred = if (initialWifi == null) {
                     CompletableDeferred<Network?>()
@@ -195,7 +258,12 @@ class DirectVpnService : VpnService() {
                     Log.w(TAG, "setUnderlyingNetworks(null) failed after establish", e)
                 }
 
-                val configFile = writeHevConfig(hostIp, hostPort)
+                val configFile = writeHevConfig(
+                    hostIp = hostIp,
+                    hostPort = hostPort,
+                    authUsername = authUsername,
+                    authPassword = authPassword,
+                )
                 val tunFd = pfd.fd
 
                 val startedAt = System.currentTimeMillis()
@@ -242,11 +310,26 @@ class DirectVpnService : VpnService() {
         statsJob?.cancel()
         statsJob = serviceScope.launch {
             while (isActive && !stopping.get()) {
+                val now = System.currentTimeMillis()
                 val stats = HevTunnelBridge.getStats()
                 val txPackets = stats.getOrElse(0) { 0L }
                 val txBytes = stats.getOrElse(1) { 0L }
                 val rxPackets = stats.getOrElse(2) { 0L }
                 val rxBytes = stats.getOrElse(3) { 0L }
+
+                if (lastStatsSampleMs > 0L) {
+                    val elapsedMs = (now - lastStatsSampleMs).coerceAtLeast(1L)
+                    val deltaRx = (rxBytes - lastRxBytesSample).coerceAtLeast(0L)
+                    val deltaTx = (txBytes - lastTxBytesSample).coerceAtLeast(0L)
+                    currentRxBytesPerSec = (deltaRx * 1000L) / elapsedMs
+                    currentTxBytesPerSec = (deltaTx * 1000L) / elapsedMs
+                } else {
+                    currentRxBytesPerSec = 0L
+                    currentTxBytesPerSec = 0L
+                }
+                lastRxBytesSample = rxBytes
+                lastTxBytesSample = txBytes
+                lastStatsSampleMs = now
 
                 ClientVpnStateHolder.update { current ->
                     current.copy(
@@ -262,12 +345,22 @@ class DirectVpnService : VpnService() {
         }
     }
 
-    private fun writeHevConfig(hostIp: String, hostPort: Int): File {
+    private fun writeHevConfig(
+        hostIp: String,
+        hostPort: Int,
+        authUsername: String = "",
+        authPassword: String = "",
+    ): File {
         val sanitizedIp = hostIp
             .replace("\r", "")
             .replace("\n", "")
             .replace("'", "")
             .replace("\"", "")
+            .trim()
+        val cleanPassword = authPassword
+            .replace("\r", "")
+            .replace("\n", "")
+            .replace("\u0000", "")
             .trim()
         val yaml = buildString {
             appendLine("tunnel:")
@@ -278,6 +371,12 @@ class DirectVpnService : VpnService() {
             appendLine("  port: $hostPort")
             appendLine("  address: '$sanitizedIp'")
             appendLine("  udp: 'udp'")
+            if (cleanPassword.isNotEmpty()) {
+                val safeUser = escapeYamlSingleQuoted(authUsername.trim())
+                val safePass = escapeYamlSingleQuoted(cleanPassword)
+                appendLine("  username: '$safeUser'")
+                appendLine("  password: '$safePass'")
+            }
             appendLine("mapdns:")
             appendLine("  address: $MAPDNS_ADDRESS")
             appendLine("  port: $MAPDNS_PORT")
@@ -294,6 +393,14 @@ class DirectVpnService : VpnService() {
         val configFile = File(filesDir, HEV_CONFIG_FILENAME)
         configFile.writeText(yaml)
         return configFile
+    }
+
+    private fun escapeYamlSingleQuoted(value: String): String {
+        return value
+            .replace("\r", "")
+            .replace("\n", "")
+            .replace("\u0000", "")
+            .replace("'", "''")
     }
 
     @Suppress("DEPRECATION")
@@ -510,13 +617,32 @@ class DirectVpnService : VpnService() {
             return
         }
 
-        val title = "DirectRouter VPN • ${state.hostIp}:${state.hostPort}"
-        val text = "↓ ${formatBytesCompact(state.rxBytes)}  ↑ ${formatBytesCompact(state.txBytes)}"
+        val settings = currentSettings
+        val title = if (settings.notifPrivacyMode || state.status == ServiceStatus.STARTING) {
+            "DirectRouter VPN"
+        } else {
+            "DirectRouter VPN • ${state.hostIp}:${state.hostPort}"
+        }
+        val text = when {
+            state.status == ServiceStatus.STARTING -> "Conectando túnel VPN..."
+            settings.notifShowLiveSpeed ->
+                "↓ ${formatRate(currentRxBytesPerSec)}  ↑ ${formatRate(currentTxBytesPerSec)} • ${formatBytesCompact(state.rxBytes + state.txBytes)}"
+            else -> "Túnel VPN activo"
+        }
+
         val manager = getSystemService(NotificationManager::class.java) ?: return
-        manager.notify(NOTIFICATION_ID, buildNotification(title, text))
+        try {
+            manager.notify(NOTIFICATION_ID, buildNotification(title, text, settings))
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Unable to update VPN notification", e)
+        }
     }
 
-    private fun buildNotification(title: String, text: String): Notification {
+    private fun buildNotification(
+        title: String,
+        text: String,
+        settings: RouterSettings = currentSettings,
+    ): Notification {
         val openIntent = Intent().apply {
             setClassName(this@DirectVpnService, "com.directrouter.app.MainActivity")
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -528,29 +654,55 @@ class DirectVpnService : VpnService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
-        val disconnectIntent = Intent(this, DirectVpnService::class.java).apply {
-            action = ACTION_DISCONNECT
-        }
-        val disconnectPendingIntent = PendingIntent.getService(
-            this,
-            11,
-            disconnectIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_vpn_tunnel)
             .setContentTitle(title)
             .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(openPendingIntent)
-            .addAction(
+
+        if (settings.notifPrivacyMode) {
+            val publicVersion = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_stat_vpn_tunnel)
+                .setContentTitle("DirectRouter VPN")
+                .setContentText("Túnel VPN activo")
+                .setOngoing(true)
+                .build()
+            builder
+                .setVisibility(NotificationCompat.VISIBILITY_SECRET)
+                .setPublicVersion(publicVersion)
+        } else {
+            builder.setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+        }
+
+        if (settings.notifShowStopAction) {
+            val disconnectIntent = Intent(this, DirectVpnService::class.java).apply {
+                action = ACTION_DISCONNECT
+            }
+            val disconnectPendingIntent = PendingIntent.getService(
+                this,
+                11,
+                disconnectIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(
                 android.R.drawable.ic_menu_close_clear_cancel,
                 "Desconectar",
                 disconnectPendingIntent,
             )
-            .build()
+        }
+
+        return builder.build()
+    }
+
+    private fun formatRate(bytesPerSec: Long): String {
+        val safe = bytesPerSec.coerceAtLeast(0L)
+        return when {
+            safe >= 1024L * 1024L -> String.format(Locale.US, "%.1f MB/s", safe / (1024.0 * 1024.0))
+            safe >= 1024L -> String.format(Locale.US, "%.0f KB/s", safe / 1024.0)
+            else -> "$safe B/s"
+        }
     }
 
     private fun formatBytesCompact(bytes: Long): String {
@@ -588,12 +740,25 @@ class DirectVpnService : VpnService() {
         const val ACTION_DISCONNECT = "com.directrouter.app.action.VPN_DISCONNECT"
         const val EXTRA_HOST_IP = "extra_host_ip"
         const val EXTRA_HOST_PORT = "extra_host_port"
+        const val EXTRA_AUTH_USERNAME = "extra_auth_username"
+        const val EXTRA_AUTH_PASSWORD = "extra_auth_password"
 
-        fun connect(context: Context, hostIp: String, hostPort: Int) {
+        @JvmOverloads
+        fun connect(
+            context: Context,
+            hostIp: String,
+            hostPort: Int,
+            authUsername: String? = null,
+            authPassword: String? = null,
+        ) {
             val intent = Intent(context, DirectVpnService::class.java).apply {
                 action = ACTION_CONNECT
                 putExtra(EXTRA_HOST_IP, hostIp)
                 putExtra(EXTRA_HOST_PORT, hostPort)
+                if (authPassword != null) {
+                    putExtra(EXTRA_AUTH_USERNAME, authUsername.orEmpty())
+                    putExtra(EXTRA_AUTH_PASSWORD, authPassword)
+                }
             }
             ContextCompat.startForegroundService(context, intent)
         }
