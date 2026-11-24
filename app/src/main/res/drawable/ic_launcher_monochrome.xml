@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Dual directional orbital arcs (inside 66dp adaptive icon safe zone) -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M33.69,40.30 A24.5,24.5 0 0,1 74.31,40.30 M74.31,67.70 A24.5,24.5 0 0,1 33.69,67.70"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"
+        android:strokeWidth="3.4" />
+
+    <!-- Directional chevrons -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M75.11,34.69 L74.31,40.30 L68.81,38.94 M32.89,73.31 L33.69,67.70 L39.19,69.06"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="3.1" />
+
+    <!-- Hexagonal mesh-node shell with clean left & right tunnel portals -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M41,50.5 L41,46.5 L54,39 L67,46.5 L67,50.5 M67,57.5 L67,61.5 L54,69 L41,61.5 L41,57.5"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="3.2" />
+
+    <!-- Direct device-to-device tunnel bridge -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M33.2,54 L74.8,54"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"
+        android:strokeWidth="3.2" />
+
+    <!-- Left peer node, center router core, and right peer node -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30.5,50.4 A3.6,3.6 0 1,1 30.5,57.6 A3.6,3.6 0 1,1 30.5,50.4 Z M54,49.8 A4.2,4.2 0 1,1 54,58.2 A4.2,4.2 0 1,1 54,49.8 Z M77.5,50.4 A3.6,3.6 0 1,1 77.5,57.6 A3.6,3.6 0 1,1 77.5,50.4 Z" />
+</vector>
