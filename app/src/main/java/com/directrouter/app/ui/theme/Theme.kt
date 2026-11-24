@@ -1,19 +1,24 @@
 package com.directrouter.app.ui.theme
 
+import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.directrouter.app.data.AppThemeMode
 import java.util.Locale
 
 internal fun tr(es: String, en: String): String {
@@ -38,64 +43,106 @@ object RouterStatusColors {
     val DeepBlueAccent = Color(0xFF0284C7)
 }
 
+/**
+ * "Pulso Eléctrico / Mesh-Node" Obsidian-Blue Dark Color Scheme.
+ */
 private val DirectRouterDarkColorScheme = darkColorScheme(
     primary = Color(0xFF38BDF8),
     onPrimary = Color(0xFF042235),
-    primaryContainer = Color(0xFF0C3654),
-    onPrimaryContainer = Color(0xFFC7ECFF),
-    secondary = Color(0xFF34D399),
-    onSecondary = Color(0xFF032C1E),
-    secondaryContainer = Color(0xFF0B3D2E),
+    primaryContainer = Color(0xFF0B3554),
+    onPrimaryContainer = Color(0xFFCDEEFF),
+    secondary = Color(0xFF10B981),
+    onSecondary = Color(0xFF02281B),
+    secondaryContainer = Color(0xFF073B2B),
     onSecondaryContainer = Color(0xFFA7F3D0),
-    tertiary = Color(0xFF818CF8),
-    onTertiary = Color(0xFF16194A),
-    tertiaryContainer = Color(0xFF282D69),
-    onTertiaryContainer = Color(0xFFE0E7FF),
-    background = Color(0xFF0A101D),
-    onBackground = Color(0xFFE6EDF7),
-    surface = Color(0xFF0A101D),
-    onSurface = Color(0xFFE6EDF7),
-    surfaceVariant = Color(0xFF162135),
-    onSurfaceVariant = Color(0xFF9FB0C8),
-    surfaceContainerLowest = Color(0xFF070C16),
-    surfaceContainerLow = Color(0xFF101829),
-    surfaceContainer = Color(0xFF152033),
-    surfaceContainerHigh = Color(0xFF1C2A42),
-    surfaceContainerHighest = Color(0xFF243552),
-    outline = Color(0xFF334666),
-    outlineVariant = Color(0xFF22314A),
+    tertiary = Color(0xFF34D399),
+    onTertiary = Color(0xFF032C1E),
+    tertiaryContainer = Color(0xFF0B4030),
+    onTertiaryContainer = Color(0xFFD1FAE5),
+    background = Color(0xFF060B16),
+    onBackground = Color(0xFFE9F0FA),
+    surface = Color(0xFF060B16),
+    onSurface = Color(0xFFE9F0FA),
+    surfaceVariant = Color(0xFF121D33),
+    onSurfaceVariant = Color(0xFF9BB0CB),
+    surfaceContainerLowest = Color(0xFF040811),
+    surfaceContainerLow = Color(0xFF0A1324),
+    surfaceContainer = Color(0xFF0F1B31),
+    surfaceContainerHigh = Color(0xFF162542),
+    surfaceContainerHighest = Color(0xFF1E3154),
+    outline = Color(0xFF31476B),
+    outlineVariant = Color(0xFF1D2D49),
     error = Color(0xFFFB7185),
     onError = Color(0xFF4C0519),
     errorContainer = Color(0xFF4C1120),
     onErrorContainer = Color(0xFFFFD6DC),
 )
 
+/**
+ * True-Black AMOLED Color Scheme with pure #000000 background & lowest surfaces,
+ * crisp dark elevated cards (#0B0F17 / #111827), and high-contrast Electric Cyan / Emerald accents.
+ */
+private val DirectRouterAmoledColorScheme = darkColorScheme(
+    primary = Color(0xFF38BDF8),
+    onPrimary = Color(0xFF001E2E),
+    primaryContainer = Color(0xFF082D47),
+    onPrimaryContainer = Color(0xFFD6F1FF),
+    secondary = Color(0xFF10B981),
+    onSecondary = Color(0xFF002116),
+    secondaryContainer = Color(0xFF053325),
+    onSecondaryContainer = Color(0xFFA7F3D0),
+    tertiary = Color(0xFF34D399),
+    onTertiary = Color(0xFF002116),
+    tertiaryContainer = Color(0xFF063829),
+    onTertiaryContainer = Color(0xFFD1FAE5),
+    background = Color(0xFF000000),
+    onBackground = Color(0xFFF1F5F9),
+    surface = Color(0xFF000000),
+    onSurface = Color(0xFFF1F5F9),
+    surfaceVariant = Color(0xFF111827),
+    onSurfaceVariant = Color(0xFF94A3B8),
+    surfaceContainerLowest = Color(0xFF000000),
+    surfaceContainerLow = Color(0xFF070A10),
+    surfaceContainer = Color(0xFF0B0F17),
+    surfaceContainerHigh = Color(0xFF111827),
+    surfaceContainerHighest = Color(0xFF1A2233),
+    outline = Color(0xFF2D3B50),
+    outlineVariant = Color(0xFF1B2433),
+    error = Color(0xFFFB7185),
+    onError = Color(0xFF4C0519),
+    errorContainer = Color(0xFF420D1A),
+    onErrorContainer = Color(0xFFFFD6DC),
+)
+
+/**
+ * Clean Crisp Light Color Scheme harmonized with the "Pulso Eléctrico / Mesh-Node" palette.
+ */
 private val DirectRouterLightColorScheme = lightColorScheme(
     primary = Color(0xFF0284C7),
     onPrimary = Color(0xFFFFFFFF),
-    primaryContainer = Color(0xFFE0F2FE),
+    primaryContainer = Color(0xFFDCF2FE),
     onPrimaryContainer = Color(0xFF082F49),
     secondary = Color(0xFF059669),
     onSecondary = Color(0xFFFFFFFF),
     secondaryContainer = Color(0xFFD1FAE5),
     onSecondaryContainer = Color(0xFF064E3B),
-    tertiary = Color(0xFF4F46E5),
+    tertiary = Color(0xFF0D9488),
     onTertiary = Color(0xFFFFFFFF),
-    tertiaryContainer = Color(0xFFE0E7FF),
-    onTertiaryContainer = Color(0xFF1E1B4B),
-    background = Color(0xFFF3F6FB),
-    onBackground = Color(0xFF0F172A),
-    surface = Color(0xFFF3F6FB),
-    onSurface = Color(0xFF0F172A),
-    surfaceVariant = Color(0xFFE2E8F0),
+    tertiaryContainer = Color(0xFFCCFBF1),
+    onTertiaryContainer = Color(0xFF134E4A),
+    background = Color(0xFFF4F7FB),
+    onBackground = Color(0xFF0B1324),
+    surface = Color(0xFFF4F7FB),
+    onSurface = Color(0xFF0B1324),
+    surfaceVariant = Color(0xFFE3EAF4),
     onSurfaceVariant = Color(0xFF475569),
     surfaceContainerLowest = Color(0xFFFFFFFF),
     surfaceContainerLow = Color(0xFFF8FAFC),
     surfaceContainer = Color(0xFFFFFFFF),
-    surfaceContainerHigh = Color(0xFFF1F5F9),
-    surfaceContainerHighest = Color(0xFFE2E8F0),
-    outline = Color(0xFFCBD5E1),
-    outlineVariant = Color(0xFFE2E8F0),
+    surfaceContainerHigh = Color(0xFFEFF4FA),
+    surfaceContainerHighest = Color(0xFFE2EAF4),
+    outline = Color(0xFFC5D2E3),
+    outlineVariant = Color(0xFFDFE7F2),
     error = Color(0xFFE11D48),
     onError = Color(0xFFFFFFFF),
     errorContainer = Color(0xFFFFE4E6),
@@ -160,11 +207,53 @@ private val DirectRouterShapes = Shapes(
 )
 
 @Composable
+fun isDarkThemeActive(themeMode: AppThemeMode): Boolean {
+    return when (themeMode) {
+        AppThemeMode.LIGHT -> false
+        AppThemeMode.DARK, AppThemeMode.AMOLED -> true
+        AppThemeMode.SYSTEM -> isSystemInDarkTheme()
+    }
+}
+
+@Composable
 fun DirectRouterTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
+    themeMode: AppThemeMode = AppThemeMode.SYSTEM,
+    dynamicColor: Boolean = false,
     content: @Composable () -> Unit,
 ) {
-    val colorScheme = if (darkTheme) DirectRouterDarkColorScheme else DirectRouterLightColorScheme
+    val isDark = isDarkThemeActive(themeMode)
+    val isAmoled = themeMode == AppThemeMode.AMOLED
+    val useDynamic = dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+
+    val colorScheme = if (useDynamic) {
+        val context = LocalContext.current
+        if (isDark) {
+            val dynamicDark = dynamicDarkColorScheme(context)
+            if (isAmoled) {
+                dynamicDark.copy(
+                    background = Color(0xFF000000),
+                    surface = Color(0xFF000000),
+                    surfaceContainerLowest = Color(0xFF000000),
+                    surfaceContainerLow = Color(0xFF070A10),
+                    surfaceContainer = Color(0xFF0B0F17),
+                    surfaceContainerHigh = Color(0xFF111827),
+                    surfaceContainerHighest = Color(0xFF1A2233),
+                    surfaceVariant = Color(0xFF111827),
+                    outlineVariant = Color(0xFF1B2433),
+                )
+            } else {
+                dynamicDark
+            }
+        } else {
+            dynamicLightColorScheme(context)
+        }
+    } else {
+        when {
+            isAmoled -> DirectRouterAmoledColorScheme
+            isDark -> DirectRouterDarkColorScheme
+            else -> DirectRouterLightColorScheme
+        }
+    }
 
     MaterialTheme(
         colorScheme = colorScheme,

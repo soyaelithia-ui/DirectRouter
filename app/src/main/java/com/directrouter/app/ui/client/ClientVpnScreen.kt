@@ -9,6 +9,7 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,12 +29,18 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Error
+import androidx.compose.material.icons.rounded.ExpandLess
+import androidx.compose.material.icons.rounded.ExpandMore
+import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.NetworkCheck
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Timer
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material.icons.rounded.WifiOff
 import androidx.compose.material3.Button
@@ -42,12 +49,15 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -64,6 +74,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.directrouter.app.ConnectionProbeState
@@ -87,11 +99,20 @@ fun ClientVpnScreen(
     onProbeConnection: (hostIp: String, hostPort: Int) -> Unit,
     onClearProbe: () -> Unit,
     onShowMessage: (String) -> Unit,
+    onUpdateClientAuth: (String, String) -> Unit = { _, _ -> },
 ) {
     val context = LocalContext.current
 
     var hostIpInput by rememberSaveable { mutableStateOf(settings.clientHostIp) }
     var hostPortInput by rememberSaveable { mutableStateOf(settings.clientHostPort.toString()) }
+    var authUsernameInput by rememberSaveable { mutableStateOf(settings.clientAuthUsername) }
+    var authPasswordInput by rememberSaveable { mutableStateOf(settings.clientAuthPassword) }
+    var showAuthPassword by rememberSaveable { mutableStateOf(false) }
+    var authExpanded by rememberSaveable {
+        mutableStateOf(
+            settings.clientAuthUsername.isNotBlank() || settings.clientAuthPassword.isNotBlank(),
+        )
+    }
 
     LaunchedEffect(settings.clientHostIp) {
         hostIpInput = settings.clientHostIp
@@ -99,10 +120,24 @@ fun ClientVpnScreen(
     LaunchedEffect(settings.clientHostPort) {
         hostPortInput = settings.clientHostPort.toString()
     }
+    LaunchedEffect(settings.clientAuthUsername) {
+        authUsernameInput = settings.clientAuthUsername
+    }
+    LaunchedEffect(settings.clientAuthPassword) {
+        authPasswordInput = settings.clientAuthPassword
+    }
 
     val parsedPort = hostPortInput.trim().toIntOrNull()
     val ipValid = ValidationUtils.isValidHostIp(hostIpInput.trim())
     val portValid = parsedPort != null && ValidationUtils.isValidPort(parsedPort)
+
+    val trimmedAuthUser = authUsernameInput.trim()
+    val trimmedAuthPass = authPasswordInput.trim()
+    val hasAnyAuthInput = trimmedAuthUser.isNotEmpty() || trimmedAuthPass.isNotEmpty()
+    val authUserValid = !hasAnyAuthInput || ValidationUtils.isValidProxyAuthCredential(trimmedAuthUser)
+    val authPassValid = !hasAnyAuthInput || ValidationUtils.isValidProxyAuthCredential(trimmedAuthPass)
+    val authValid = authUserValid && authPassValid
+    val hasSavedAuth = settings.clientAuthUsername.isNotBlank() && settings.clientAuthPassword.isNotBlank()
 
     val isRunning = clientState.status == ServiceStatus.RUNNING
     val isStarting = clientState.status == ServiceStatus.STARTING
@@ -143,6 +178,24 @@ fun ClientVpnScreen(
         0L
     }
 
+    fun persistClientAuthIfValid(): Boolean {
+        if (!hasAnyAuthInput) {
+            onUpdateClientAuth("", "")
+            return true
+        }
+        if (!authValid) {
+            onShowMessage(
+                tr(
+                    "Completa usuario y contraseña válidos (sin espacios ni ':') o deja ambos vacíos.",
+                    "Enter valid username and password (no spaces or ':') or leave both blank.",
+                ),
+            )
+            return false
+        }
+        onUpdateClientAuth(trimmedAuthUser, trimmedAuthPass)
+        return true
+    }
+
     fun triggerVpnToggle() {
         if (isRunning || isStarting) {
             onDisconnectVpn()
@@ -157,6 +210,9 @@ fun ClientVpnScreen(
                     "Check Host IP and Port (1024–65535).",
                 ),
             )
+            return
+        }
+        if (!persistClientAuthIfValid()) {
             return
         }
         val prepareIntent = VpnService.prepare(context)
@@ -409,6 +465,173 @@ fun ClientVpnScreen(
                         )
                     }
 
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                    // Collapsible optional Proxy Authentication section
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(MaterialTheme.shapes.small)
+                                .clickable { authExpanded = !authExpanded }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Key,
+                                    contentDescription = null,
+                                    tint = if (hasSavedAuth || hasAnyAuthInput) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                    modifier = Modifier.size(18.dp),
+                                )
+                                Text(
+                                    text = tr(
+                                        "Autenticación del Proxy (opcional)",
+                                        "Proxy Authentication (optional)",
+                                    ),
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                            }
+
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                if (hasSavedAuth) {
+                                    Surface(
+                                        shape = RoundedCornerShape(50),
+                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                                    ) {
+                                        Text(
+                                            text = tr("Activa", "Active"),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            fontWeight = FontWeight.SemiBold,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                        )
+                                    }
+                                }
+                                Icon(
+                                    imageVector = if (authExpanded) {
+                                        Icons.Rounded.ExpandLess
+                                    } else {
+                                        Icons.Rounded.ExpandMore
+                                    },
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+
+                        AnimatedVisibility(visible = authExpanded) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                Text(
+                                    text = tr(
+                                        "Solo es necesaria si activaste la autenticación Usuario/Contraseña en el Host. Déjalo vacío si el Host no exige contraseña.",
+                                        "Only needed if Username/Password authentication is enabled on the Host. Leave blank if the Host does not require credentials.",
+                                    ),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+
+                                OutlinedTextField(
+                                    value = authUsernameInput,
+                                    onValueChange = { authUsernameInput = it.take(ValidationUtils.MAX_PROXY_AUTH_CREDENTIAL_LENGTH) },
+                                    label = { Text(tr("Usuario", "Username")) },
+                                    singleLine = true,
+                                    enabled = !isRunning && !isStarting,
+                                    isError = hasAnyAuthInput && !authUserValid,
+                                    supportingText = {
+                                        if (hasAnyAuthInput && !authUserValid) {
+                                            Text(
+                                                tr(
+                                                    "Requerido (ASCII sin espacios ni ':')",
+                                                    "Required (ASCII without spaces or ':')",
+                                                ),
+                                            )
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+
+                                OutlinedTextField(
+                                    value = authPasswordInput,
+                                    onValueChange = { authPasswordInput = it.take(ValidationUtils.MAX_PROXY_AUTH_CREDENTIAL_LENGTH) },
+                                    label = { Text(tr("Contraseña", "Password")) },
+                                    singleLine = true,
+                                    enabled = !isRunning && !isStarting,
+                                    isError = hasAnyAuthInput && !authPassValid,
+                                    visualTransformation = if (showAuthPassword) {
+                                        VisualTransformation.None
+                                    } else {
+                                        PasswordVisualTransformation()
+                                    },
+                                    trailingIcon = {
+                                        IconButton(onClick = { showAuthPassword = !showAuthPassword }) {
+                                            Icon(
+                                                imageVector = if (showAuthPassword) {
+                                                    Icons.Rounded.VisibilityOff
+                                                } else {
+                                                    Icons.Rounded.Visibility
+                                                },
+                                                contentDescription = tr("Mostrar u ocultar", "Toggle visibility"),
+                                            )
+                                        }
+                                    },
+                                    supportingText = {
+                                        if (hasAnyAuthInput && !authPassValid) {
+                                            Text(
+                                                tr(
+                                                    "Requerida (ASCII sin espacios ni ':')",
+                                                    "Required (ASCII without spaces or ':')",
+                                                ),
+                                            )
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+
+                                if (hasAnyAuthInput || hasSavedAuth) {
+                                    TextButton(
+                                        onClick = {
+                                            authUsernameInput = ""
+                                            authPasswordInput = ""
+                                            onUpdateClientAuth("", "")
+                                            onShowMessage(
+                                                tr("Credenciales de cliente borradas", "Client credentials cleared"),
+                                            )
+                                        },
+                                        enabled = !isRunning && !isStarting,
+                                        modifier = Modifier.align(Alignment.End),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.DeleteOutline,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp),
+                                        )
+                                        Spacer(Modifier.width(4.dp))
+                                        Text(tr("Limpiar credenciales", "Clear credentials"))
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -449,13 +672,16 @@ fun ClientVpnScreen(
                         OutlinedButton(
                             onClick = {
                                 val port = parsedPort
+                                if (!persistClientAuthIfValid()) {
+                                    return@OutlinedButton
+                                }
                                 if (port != null && onSaveEndpoint(hostIpInput.trim(), port)) {
                                     onShowMessage(tr("Servidor guardado", "Host endpoint saved"))
                                 } else {
                                     onShowMessage(tr("IP o puerto inválido", "Invalid IP or port"))
                                 }
                             },
-                            enabled = !isRunning && !isStarting && ipValid && portValid,
+                            enabled = !isRunning && !isStarting && ipValid && portValid && authValid,
                             modifier = Modifier.weight(0.8f),
                         ) {
                             Icon(
