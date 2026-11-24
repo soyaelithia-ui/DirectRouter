@@ -39,8 +39,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.ArrowUpward
@@ -50,13 +53,21 @@ import androidx.compose.material.icons.rounded.Error
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.Link
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.QrCode2
+import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Security
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Shield
+import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.SwapVert
 import androidx.compose.material.icons.rounded.Timer
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.Warning
@@ -75,6 +86,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
@@ -99,6 +112,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -106,10 +120,12 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.directrouter.app.data.BindMode
 import com.directrouter.app.data.HostShareMode
 import com.directrouter.app.data.RouterSettings
 import com.directrouter.app.data.ValidationUtils
 import com.directrouter.app.host.HostServiceState
+import com.directrouter.app.host.NetworkInterfaceScanner
 import com.directrouter.app.host.ServiceStatus
 import com.directrouter.app.ui.theme.RouterStatusColors
 import com.directrouter.app.ui.theme.tr
@@ -234,6 +250,13 @@ fun HostScreen(
     onStopRouter: () -> Unit,
     onSelectShareMode: (HostShareMode) -> Unit,
     onShowMessage: (String) -> Unit,
+    isBoundAllInterfaces: Boolean = false,
+    boundAddress: String = "",
+    onRestartRouter: () -> Unit = {},
+    onUpdateProxyPort: (Int) -> Boolean = { false },
+    onUpdateBindConfig: (BindMode, String) -> Boolean = { _, _ -> false },
+    onGenerateRandomPort: () -> Int = { ValidationUtils.generateRandomPort() },
+    onOpenSettings: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -242,6 +265,7 @@ fun HostScreen(
     var pendingStartAfterPermissions by remember { mutableStateOf(false) }
     var showPassword by rememberSaveable { mutableStateOf(false) }
     var showQrDialog by rememberSaveable { mutableStateOf(false) }
+    var showQuickEditDialog by rememberSaveable { mutableStateOf(false) }
     var guideExpanded by rememberSaveable { mutableStateOf(false) }
     var selectedTetherIp by rememberSaveable { mutableStateOf<String?>(null) }
 
@@ -278,6 +302,10 @@ fun HostScreen(
     val isRunning = hostState.status == ServiceStatus.RUNNING
     val isStarting = hostState.status == ServiceStatus.STARTING
     val activeShareMode = if (isRunning || isStarting) hostState.shareMode else settings.hostShareMode
+
+    val effectiveAllInterfaces = isBoundAllInterfaces || settings.bindMode == BindMode.ALL_INTERFACES
+    val authActive = settings.proxyAuthEnabled && settings.proxyAuthPassword.isNotBlank()
+    val antiSsrfActive = settings.blockLocalhostAccess
 
     LaunchedEffect(activeShareMode, isRunning, hostState.localIpAddresses) {
         if (!isRunning || activeShareMode != HostShareMode.NATIVE_TETHERING) {
@@ -318,8 +346,13 @@ fun HostScreen(
     val displayIp = when {
         activeShareMode == HostShareMode.NATIVE_TETHERING && selectedTetherIp != null ->
             selectedTetherIp!!
+        isRunning && boundAddress.isNotBlank() && boundAddress != "0.0.0.0" ->
+            boundAddress
         isRunning && hostState.ipAddress.isNotBlank() ->
             hostState.ipAddress
+        settings.bindMode == BindMode.SPECIFIC_IP &&
+            ValidationUtils.isStrictIpv4(settings.customBindIp.trim()) ->
+            settings.customBindIp.trim()
         else ->
             defaultPreviewIp
     }
@@ -397,6 +430,9 @@ fun HostScreen(
                 status = hostState.status,
                 shareMode = activeShareMode,
                 errorMessage = hostState.errorMessage,
+                isAllInterfaces = effectiveAllInterfaces,
+                authActive = authActive,
+                antiSsrfActive = antiSsrfActive,
                 onSelectShareMode = ::handleSelectShareMode,
                 onTogglePower = ::handlePowerToggle,
             )
@@ -437,6 +473,10 @@ fun HostScreen(
                 ipAddress = displayIp,
                 port = displayPort,
                 pacUrl = displayPacUrl,
+                boundAddress = boundAddress,
+                isAllInterfaces = effectiveAllInterfaces,
+                authActive = authActive,
+                antiSsrfActive = antiSsrfActive,
                 localIpAddresses = hostState.localIpAddresses,
                 showPassword = showPassword,
                 onTogglePassword = { showPassword = !showPassword },
@@ -447,6 +487,8 @@ fun HostScreen(
                 },
                 onShowQr = { showQrDialog = true },
                 onOpenTetheringSettings = { openTetheringSettings(context) },
+                onOpenQuickEdit = { showQuickEditDialog = true },
+                onOpenSettings = onOpenSettings,
             )
         }
 
@@ -485,6 +527,135 @@ fun HostScreen(
             onDismiss = { showQrDialog = false },
         )
     }
+
+    if (showQuickEditDialog) {
+        QuickPortAndBindDialog(
+            isRunning = isRunning,
+            initialPort = settings.proxyPort,
+            initialBindMode = settings.bindMode,
+            initialCustomIp = settings.customBindIp,
+            onGenerateRandomPort = onGenerateRandomPort,
+            onSave = { port, bindMode, customIp, shouldRestart ->
+                val portOk = onUpdateProxyPort(port)
+                val bindOk = onUpdateBindConfig(bindMode, customIp)
+                if (!portOk || !bindOk) {
+                    onShowMessage(
+                        tr(
+                            "Verifica el puerto (1024–65535) y la IP seleccionada.",
+                            "Check the port (1024–65535) and selected IP.",
+                        ),
+                    )
+                    false
+                } else {
+                    if (shouldRestart && isRunning) {
+                        onRestartRouter()
+                        onShowMessage(
+                            tr(
+                                "Configuración aplicada ($port). Reiniciando router...",
+                                "Settings applied ($port). Restarting router...",
+                            ),
+                        )
+                    } else {
+                        onShowMessage(
+                            tr(
+                                "Puerto ($port) y enlace IP guardados",
+                                "Port ($port) and IP binding saved",
+                            ),
+                        )
+                    }
+                    true
+                }
+            },
+            onOpenSettings = {
+                showQuickEditDialog = false
+                onOpenSettings()
+            },
+            onDismiss = { showQuickEditDialog = false },
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SecurityBadgesRow(
+    isAllInterfaces: Boolean,
+    authActive: Boolean,
+    antiSsrfActive: Boolean,
+    centered: Boolean = false,
+) {
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (centered) {
+            Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally)
+        } else {
+            Arrangement.spacedBy(6.dp)
+        },
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        if (isAllInterfaces) {
+            SecurityBadgeChip(
+                icon = Icons.Rounded.Warning,
+                label = tr("0.0.0.0 — Todas las interfaces", "0.0.0.0 — All interfaces"),
+                tint = RouterStatusColors.WarningAmber,
+            )
+        } else {
+            SecurityBadgeChip(
+                icon = Icons.Rounded.Lock,
+                label = tr("Bind local seguro", "Safe local bind"),
+                tint = RouterStatusColors.ActiveEmerald,
+            )
+        }
+
+        if (authActive) {
+            SecurityBadgeChip(
+                icon = Icons.Rounded.Key,
+                label = tr("Auth activa", "Auth ON"),
+                tint = MaterialTheme.colorScheme.primary,
+            )
+        }
+
+        if (antiSsrfActive) {
+            SecurityBadgeChip(
+                icon = Icons.Rounded.Shield,
+                label = "Anti-SSRF",
+                tint = RouterStatusColors.ActiveEmerald,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SecurityBadgeChip(
+    icon: ImageVector,
+    label: String,
+    tint: Color,
+) {
+    Surface(
+        shape = RoundedCornerShape(50),
+        color = tint.copy(alpha = 0.14f),
+        border = BorderStroke(1.dp, tint.copy(alpha = 0.36f)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = tint,
+                modifier = Modifier.size(13.dp),
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = tint,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -493,6 +664,9 @@ private fun HeroPowerCard(
     status: ServiceStatus,
     shareMode: HostShareMode,
     errorMessage: String?,
+    isAllInterfaces: Boolean,
+    authActive: Boolean,
+    antiSsrfActive: Boolean,
     onSelectShareMode: (HostShareMode) -> Unit,
     onTogglePower: () -> Unit,
 ) {
@@ -602,7 +776,16 @@ private fun HeroPowerCard(
                 dotColor = ringColor,
             )
 
-            Spacer(modifier = Modifier.height(18.dp))
+            Spacer(modifier = Modifier.height(10.dp))
+
+            SecurityBadgesRow(
+                isAllInterfaces = isAllInterfaces,
+                authActive = authActive,
+                antiSsrfActive = antiSsrfActive,
+                centered = true,
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
 
             Box(
                 contentAlignment = Alignment.Center,
@@ -916,6 +1099,10 @@ private fun CredentialsCard(
     ipAddress: String,
     port: Int,
     pacUrl: String,
+    boundAddress: String,
+    isAllInterfaces: Boolean,
+    authActive: Boolean,
+    antiSsrfActive: Boolean,
     localIpAddresses: List<String>,
     showPassword: Boolean,
     onTogglePassword: () -> Unit,
@@ -923,6 +1110,8 @@ private fun CredentialsCard(
     onSelectInterfaceIp: (String) -> Unit,
     onShowQr: () -> Unit,
     onOpenTetheringSettings: () -> Unit,
+    onOpenQuickEdit: () -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     val isNativeTethering = shareMode == HostShareMode.NATIVE_TETHERING
 
@@ -932,10 +1121,10 @@ private fun CredentialsCard(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
         border = BorderStroke(
             width = 1.dp,
-            color = if (isRunning) {
-                RouterStatusColors.ActiveEmerald.copy(alpha = 0.4f)
-            } else {
-                MaterialTheme.colorScheme.outlineVariant
+            color = when {
+                isAllInterfaces && isRunning -> RouterStatusColors.WarningAmber.copy(alpha = 0.55f)
+                isRunning -> RouterStatusColors.ActiveEmerald.copy(alpha = 0.4f)
+                else -> MaterialTheme.colorScheme.outlineVariant
             },
         ),
     ) {
@@ -957,6 +1146,7 @@ private fun CredentialsCard(
                         tr("Credenciales Wi-Fi Direct y Proxy", "Wi-Fi Direct & Proxy Credentials")
                     },
                     style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f),
                 )
                 Surface(
                     shape = RoundedCornerShape(8.dp),
@@ -976,6 +1166,42 @@ private fun CredentialsCard(
                         },
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
                     )
+                }
+            }
+
+            SecurityBadgesRow(
+                isAllInterfaces = isAllInterfaces,
+                authActive = authActive,
+                antiSsrfActive = antiSsrfActive,
+            )
+
+            if (isAllInterfaces) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.small,
+                    color = RouterStatusColors.WarningAmber.copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, RouterStatusColors.WarningAmber.copy(alpha = 0.35f)),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Warning,
+                            contentDescription = null,
+                            tint = RouterStatusColors.WarningAmber,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Text(
+                            text = tr(
+                                "Escuchando en 0.0.0.0: dispositivos en otras redes Wi-Fi conectadas podrían alcanzar el proxy.",
+                                "Listening on 0.0.0.0: devices on other connected Wi-Fi networks may reach the proxy.",
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
                 }
             }
 
@@ -1036,6 +1262,20 @@ private fun CredentialsCard(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
+                            if (isRunning && boundAddress.isNotBlank()) {
+                                Text(
+                                    text = "Bind: $boundAddress",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = if (boundAddress == "0.0.0.0") {
+                                        RouterStatusColors.WarningAmber
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
                         }
                         IconButton(onClick = { onCopy("IP", ipAddress) }) {
                             Icon(
@@ -1173,6 +1413,37 @@ private fun CredentialsCard(
                 }
             }
 
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedButton(
+                    onClick = onOpenQuickEdit,
+                    modifier = Modifier.weight(1f),
+                    shape = MaterialTheme.shapes.small,
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Tune,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = tr("Puerto e IP", "Port & IP"),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                IconButton(onClick = onOpenSettings) {
+                    Icon(
+                        imageVector = Icons.Rounded.Settings,
+                        contentDescription = tr("Abrir ajustes", "Open settings"),
+                    )
+                }
+            }
+
             if (isNativeTethering) {
                 FilledTonalButton(
                     onClick = onOpenTetheringSettings,
@@ -1201,6 +1472,350 @@ private fun CredentialsCard(
                     Spacer(Modifier.width(8.dp))
                     Text(tr("Mostrar código QR Wi-Fi", "Show Wi-Fi QR Code"))
                 }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun QuickPortAndBindDialog(
+    isRunning: Boolean,
+    initialPort: Int,
+    initialBindMode: BindMode,
+    initialCustomIp: String,
+    onGenerateRandomPort: () -> Int,
+    onSave: (port: Int, bindMode: BindMode, customIp: String, shouldRestart: Boolean) -> Boolean,
+    onOpenSettings: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var portInput by rememberSaveable { mutableStateOf(initialPort.toString()) }
+    var bindMode by rememberSaveable { mutableStateOf(initialBindMode) }
+    var customIpInput by rememberSaveable { mutableStateOf(initialCustomIp) }
+    var detectedInterfaces by remember { mutableStateOf(NetworkInterfaceScanner.scanTetheringIps()) }
+
+    val parsedPort = portInput.trim().toIntOrNull()
+    val portValid = parsedPort != null && ValidationUtils.isValidPort(parsedPort)
+    val trimmedIp = customIpInput.trim()
+    val customIpValid = bindMode != BindMode.SPECIFIC_IP || ValidationUtils.isStrictIpv4(trimmedIp)
+    val canSave = portValid && customIpValid
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Tune,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+                Text(
+                    text = tr("Puerto e IP del Proxy", "Proxy Port & IP"),
+                    style = MaterialTheme.typography.titleLarge,
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedTextField(
+                        value = portInput,
+                        onValueChange = { value ->
+                            portInput = value.filter { it.isDigit() }.take(5)
+                        },
+                        label = { Text(tr("Puerto (1024–65535)", "Port (1024–65535)")) },
+                        singleLine = true,
+                        isError = portInput.isNotEmpty() && !portValid,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f),
+                    )
+                    FilledTonalButton(
+                        onClick = { portInput = onGenerateRandomPort().toString() },
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 14.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Shuffle,
+                            contentDescription = tr("Puerto aleatorio", "Random port"),
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+
+                if (portInput.isNotEmpty() && !portValid) {
+                    Text(
+                        text = tr("El puerto debe estar entre 1024 y 65535.", "Port must be between 1024 and 65535."),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                Text(
+                    text = tr("Modo de enlace IP", "IP Binding Mode"),
+                    style = MaterialTheme.typography.titleSmall,
+                )
+
+                BindModeOptionRow(
+                    selected = bindMode == BindMode.AUTO_LOCAL,
+                    title = tr("Automático seguro", "Safe Auto"),
+                    subtitle = tr(
+                        "Enlaza solo a Wi-Fi Direct o a la interfaz local de Tethering.",
+                        "Binds only to Wi-Fi Direct or local Tethering interface.",
+                    ),
+                    onClick = { bindMode = BindMode.AUTO_LOCAL },
+                )
+
+                BindModeOptionRow(
+                    selected = bindMode == BindMode.SPECIFIC_IP,
+                    title = tr("IP específica", "Specific IP"),
+                    subtitle = tr(
+                        "Elige una interfaz activa o escribe una IP local IPv4.",
+                        "Pick an active interface or type a local IPv4 address.",
+                    ),
+                    onClick = { bindMode = BindMode.SPECIFIC_IP },
+                )
+
+                AnimatedVisibility(visible = bindMode == BindMode.SPECIFIC_IP) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(
+                                text = tr("Interfaces activas", "Active interfaces"),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            TextButton(
+                                onClick = { detectedInterfaces = NetworkInterfaceScanner.scanTetheringIps() },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Refresh,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(15.dp),
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Text(tr("Actualizar", "Refresh"), style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+
+                        if (detectedInterfaces.isNotEmpty()) {
+                            FlowRow(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                detectedInterfaces.forEach { iface ->
+                                    FilterChip(
+                                        selected = trimmedIp == iface.ipAddress,
+                                        onClick = { customIpInput = iface.ipAddress },
+                                        label = {
+                                            Text(
+                                                text = "${iface.ipAddress} (${iface.name})",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontFamily = FontFamily.Monospace,
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                        }
+
+                        OutlinedTextField(
+                            value = customIpInput,
+                            onValueChange = { customIpInput = it.trim() },
+                            label = { Text(tr("IP local IPv4", "Local IPv4")) },
+                            placeholder = { Text("192.168.43.1") },
+                            singleLine = true,
+                            isError = customIpInput.isNotEmpty() && !customIpValid,
+                            supportingText = {
+                                if (customIpInput.isNotEmpty() && !customIpValid) {
+                                    Text(tr("Introduce una IPv4 válida", "Enter a valid IPv4 address"))
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+
+                BindModeOptionRow(
+                    selected = bindMode == BindMode.ALL_INTERFACES,
+                    title = tr("Todas (0.0.0.0)", "All (0.0.0.0)"),
+                    subtitle = tr(
+                        "Modo experto: acepta conexiones en todas las interfaces.",
+                        "Expert mode: accepts connections on all interfaces.",
+                    ),
+                    onClick = { bindMode = BindMode.ALL_INTERFACES },
+                )
+
+                AnimatedVisibility(visible = bindMode == BindMode.ALL_INTERFACES) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.small,
+                        color = RouterStatusColors.WarningAmber.copy(alpha = 0.14f),
+                        border = BorderStroke(1.dp, RouterStatusColors.WarningAmber.copy(alpha = 0.4f)),
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Warning,
+                                contentDescription = null,
+                                tint = RouterStatusColors.WarningAmber,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Text(
+                                text = tr(
+                                    "Advertencia: si estás en un Wi-Fi público, otros dispositivos de esa red podrían usar el proxy.",
+                                    "Warning: on public Wi-Fi, other devices on that network could reach your proxy.",
+                                ),
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
+                }
+
+                if (isRunning) {
+                    Button(
+                        onClick = {
+                            val port = parsedPort ?: return@Button
+                            if (onSave(port, bindMode, trimmedIp, true)) {
+                                onDismiss()
+                            }
+                        },
+                        enabled = canSave,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Refresh,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(tr("Aplicar y reiniciar", "Apply & Restart"))
+                    }
+                }
+
+                TextButton(
+                    onClick = onOpenSettings,
+                    modifier = Modifier.align(Alignment.End),
+                ) {
+                    Text(tr("Más opciones en Ajustes", "More options in Settings"))
+                }
+            }
+        },
+        confirmButton = {
+            if (isRunning) {
+                OutlinedButton(
+                    onClick = {
+                        val port = parsedPort ?: return@OutlinedButton
+                        if (onSave(port, bindMode, trimmedIp, false)) {
+                            onDismiss()
+                        }
+                    },
+                    enabled = canSave,
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Save,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(tr("Guardar", "Save"))
+                }
+            } else {
+                Button(
+                    onClick = {
+                        val port = parsedPort ?: return@Button
+                        if (onSave(port, bindMode, trimmedIp, false)) {
+                            onDismiss()
+                        }
+                    },
+                    enabled = canSave,
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Save,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(tr("Guardar", "Save"))
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(tr("Cancelar", "Cancel"))
+            }
+        },
+    )
+}
+
+@Composable
+private fun BindModeOptionRow(
+    selected: Boolean,
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit,
+) {
+    Surface(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.small,
+        color = if (selected) {
+            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+        } else {
+            MaterialTheme.colorScheme.surfaceContainerHigh
+        },
+        border = BorderStroke(
+            width = 1.dp,
+            color = if (selected) {
+                MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+            } else {
+                MaterialTheme.colorScheme.outlineVariant
+            },
+        ),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            RadioButton(selected = selected, onClick = onClick)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
