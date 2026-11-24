@@ -74,6 +74,12 @@ class SettingsRepository(context: Context) {
         }
     }
 
+    suspend fun updateHostShareMode(mode: HostShareMode) {
+        dataStore.edit { prefs ->
+            prefs[KEY_HOST_SHARE_MODE] = mode.name
+        }
+    }
+
     suspend fun updateClientEndpoint(ip: String, port: Int) {
         val trimmedIp = ip.trim()
         if (!ValidationUtils.isValidHostIp(trimmedIp) || !ValidationUtils.isValidPort(port)) {
@@ -147,6 +153,10 @@ class SettingsRepository(context: Context) {
             defaults.clientHostPort
         }
 
+        val hostShareMode = this[KEY_HOST_SHARE_MODE]
+            ?.let { raw -> HostShareMode.entries.firstOrNull { it.name == raw } }
+            ?: defaults.hostShareMode
+
         return RouterSettings(
             proxyPort = port,
             ssidSuffix = ssidSuffix,
@@ -155,6 +165,7 @@ class SettingsRepository(context: Context) {
             keepCpuAwake = keepCpuAwake,
             clientHostIp = clientHostIp,
             clientHostPort = clientHostPort,
+            hostShareMode = hostShareMode,
         )
     }
 
@@ -166,5 +177,6 @@ class SettingsRepository(context: Context) {
         val KEY_KEEP_CPU_AWAKE = booleanPreferencesKey("keep_cpu_awake")
         val KEY_CLIENT_HOST_IP = stringPreferencesKey("client_host_ip")
         val KEY_CLIENT_HOST_PORT = intPreferencesKey("client_host_port")
+        val KEY_HOST_SHARE_MODE = stringPreferencesKey("host_share_mode")
     }
 }

@@ -22,10 +22,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.BatteryChargingFull
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Info
-import androidx.compose.material.icons.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Visibility
@@ -151,8 +151,8 @@ fun SettingsScreen(
                     )
                     Text(
                         text = tr(
-                            "Un único puerto atiende HTTP/HTTPS CONNECT y SOCKS5 (TCP + UDP). Rango permitido: 1024–65535.",
-                            "A single port serves HTTP/HTTPS CONNECT and SOCKS5 (TCP + UDP). Valid range: 1024–65535.",
+                            "Un único puerto atiende HTTP/HTTPS, Auto-Proxy PAC, SOCKS4/4a y SOCKS5 (TCP + UDP). Rango permitido: 1024–65535.",
+                            "A single port serves HTTP/HTTPS, Auto-Proxy PAC, SOCKS4/4a, and SOCKS5 (TCP + UDP). Valid range: 1024–65535.",
                         ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -520,7 +520,7 @@ fun SettingsScreen(
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(10.dp),
                     ) {
-                        Icon(Icons.Rounded.OpenInNew, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Icon(Icons.AutoMirrored.Rounded.OpenInNew, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
                         Text(
                             text = if (ignoringBatteryOpt) {

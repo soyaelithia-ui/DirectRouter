@@ -1,5 +1,6 @@
 package com.directrouter.app.host
 
+import com.directrouter.app.data.HostShareMode
 import com.directrouter.app.proxy.TrafficSnapshot
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -22,7 +23,12 @@ data class HostServiceState(
     val connectedWifiClients: Int = 0,
     val traffic: TrafficSnapshot = TrafficSnapshot(),
     val errorMessage: String? = null,
-)
+    val shareMode: HostShareMode = HostShareMode.WIFI_DIRECT,
+    val localIpAddresses: List<String> = emptyList(),
+) {
+    val pacUrl: String
+        get() = "http://${ipAddress.ifBlank { "192.168.49.1" }}:$port/proxy.pac"
+}
 
 object HostStateHolder {
     private val _state = MutableStateFlow(HostServiceState())

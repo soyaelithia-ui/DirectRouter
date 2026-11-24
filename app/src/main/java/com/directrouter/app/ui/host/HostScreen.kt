@@ -27,6 +27,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -48,6 +50,7 @@ import androidx.compose.material.icons.rounded.Error
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.QrCode2
 import androidx.compose.material.icons.rounded.Security
@@ -58,17 +61,23 @@ import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material.icons.rounded.WifiOff
+import androidx.compose.material.icons.rounded.WifiTethering
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -97,6 +106,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.directrouter.app.data.HostShareMode
 import com.directrouter.app.data.RouterSettings
 import com.directrouter.app.data.ValidationUtils
 import com.directrouter.app.host.HostServiceState
@@ -107,6 +117,21 @@ import com.directrouter.app.ui.util.Formatters
 import com.directrouter.app.ui.util.QrCodeGenerator
 import kotlinx.coroutines.delay
 
+internal fun extractIpFromInterfaceEntry(entry: String): String {
+    return entry.trim().substringBefore(" ").trim()
+}
+
+private fun openTetheringSettings(context: Context) {
+    val opened = runCatching {
+        context.startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS))
+    }.isSuccess
+    if (!opened) {
+        runCatching {
+            context.startActivity(Intent(Settings.ACTION_SETTINGS))
+        }
+    }
+}
+
 private data class HostEnvironmentCheck(
     val missingWifiDirectPermission: Boolean,
     val missingNotificationPermission: Boolean,
@@ -116,11 +141,18 @@ private data class HostEnvironmentCheck(
     val needsLocationServices: Boolean
         get() = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU && !locationServicesEnabled
 
-    val hasAnyIssue: Boolean
-        get() = missingWifiDirectPermission ||
-            missingNotificationPermission ||
-            !wifiEnabled ||
-            needsLocationServices
+    fun hasAnyIssue(shareMode: HostShareMode): Boolean {
+        return when (shareMode) {
+            HostShareMode.WIFI_DIRECT ->
+                missingWifiDirectPermission ||
+                    missingNotificationPermission ||
+                    !wifiEnabled ||
+                    needsLocationServices
+
+            HostShareMode.NATIVE_TETHERING ->
+                missingNotificationPermission
+        }
+    }
 }
 
 private fun inspectHostEnvironment(context: Context): HostEnvironmentCheck {
@@ -171,14 +203,26 @@ private fun inspectHostEnvironment(context: Context): HostEnvironmentCheck {
     )
 }
 
-private fun requiredRuntimePermissions(): Array<String> {
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        arrayOf(
-            Manifest.permission.NEARBY_WIFI_DEVICES,
-            Manifest.permission.POST_NOTIFICATIONS,
-        )
-    } else {
-        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+private fun requiredRuntimePermissions(shareMode: HostShareMode): Array<String> {
+    return when (shareMode) {
+        HostShareMode.NATIVE_TETHERING -> {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS)
+            } else {
+                emptyArray()
+            }
+        }
+
+        HostShareMode.WIFI_DIRECT -> {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                arrayOf(
+                    Manifest.permission.NEARBY_WIFI_DEVICES,
+                    Manifest.permission.POST_NOTIFICATIONS,
+                )
+            } else {
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+        }
     }
 }
 
@@ -188,6 +232,7 @@ fun HostScreen(
     settings: RouterSettings,
     onStartRouter: () -> Unit,
     onStopRouter: () -> Unit,
+    onSelectShareMode: (HostShareMode) -> Unit,
     onShowMessage: (String) -> Unit,
 ) {
     val context = LocalContext.current
@@ -198,6 +243,7 @@ fun HostScreen(
     var showPassword by rememberSaveable { mutableStateOf(false) }
     var showQrDialog by rememberSaveable { mutableStateOf(false) }
     var guideExpanded by rememberSaveable { mutableStateOf(false) }
+    var selectedTetherIp by rememberSaveable { mutableStateOf<String?>(null) }
 
     DisposableEffect(lifecycleOwner, context) {
         val observer = LifecycleEventObserver { _, event ->
@@ -231,6 +277,20 @@ fun HostScreen(
 
     val isRunning = hostState.status == ServiceStatus.RUNNING
     val isStarting = hostState.status == ServiceStatus.STARTING
+    val activeShareMode = if (isRunning || isStarting) hostState.shareMode else settings.hostShareMode
+
+    LaunchedEffect(activeShareMode, isRunning, hostState.localIpAddresses) {
+        if (!isRunning || activeShareMode != HostShareMode.NATIVE_TETHERING) {
+            selectedTetherIp = null
+        } else if (selectedTetherIp != null) {
+            val stillPresent = hostState.localIpAddresses.any { entry ->
+                extractIpFromInterfaceEntry(entry) == selectedTetherIp
+            }
+            if (!stillPresent) {
+                selectedTetherIp = null
+            }
+        }
+    }
 
     var nowEpochMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(isRunning, hostState.traffic.startedAtEpochMs) {
@@ -250,8 +310,27 @@ fun HostScreen(
 
     val displaySsid = hostState.ssid.takeIf { isRunning && it.isNotBlank() } ?: settings.fullSsid
     val displayPassphrase = hostState.passphrase.takeIf { isRunning && it.isNotBlank() } ?: settings.passphrase
-    val displayIp = hostState.ipAddress.ifBlank { "192.168.49.1" }
     val displayPort = if (isRunning && hostState.port > 0) hostState.port else settings.proxyPort
+    val defaultPreviewIp = when (activeShareMode) {
+        HostShareMode.WIFI_DIRECT -> "192.168.49.1"
+        HostShareMode.NATIVE_TETHERING -> "192.168.43.1"
+    }
+    val displayIp = when {
+        activeShareMode == HostShareMode.NATIVE_TETHERING && selectedTetherIp != null ->
+            selectedTetherIp!!
+        isRunning && hostState.ipAddress.isNotBlank() ->
+            hostState.ipAddress
+        else ->
+            defaultPreviewIp
+    }
+    val displayPacUrl = when {
+        activeShareMode == HostShareMode.NATIVE_TETHERING && selectedTetherIp != null ->
+            "http://$selectedTetherIp:$displayPort/proxy.pac"
+        isRunning && hostState.pacUrl.isNotBlank() ->
+            hostState.pacUrl
+        else ->
+            "http://$displayIp:$displayPort/proxy.pac"
+    }
 
     fun copyField(label: String, value: String) {
         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -259,15 +338,34 @@ fun HostScreen(
         onShowMessage(tr("$label copiado al portapapeles", "$label copied to clipboard"))
     }
 
+    fun handleSelectShareMode(mode: HostShareMode) {
+        if (mode == activeShareMode) return
+        if (isRunning || isStarting) {
+            onShowMessage(
+                tr(
+                    "Apaga el router para cambiar de modo",
+                    "Stop the router to switch modes",
+                ),
+            )
+            return
+        }
+        selectedTetherIp = null
+        onSelectShareMode(mode)
+    }
+
     fun handlePowerToggle() {
         when (hostState.status) {
             ServiceStatus.RUNNING, ServiceStatus.STARTING -> onStopRouter()
             ServiceStatus.STOPPED, ServiceStatus.ERROR -> {
+                if (activeShareMode == HostShareMode.NATIVE_TETHERING) {
+                    onStartRouter()
+                    return
+                }
                 val fresh = inspectHostEnvironment(context)
                 envCheck = fresh
                 if (fresh.missingWifiDirectPermission) {
                     pendingStartAfterPermissions = true
-                    permissionLauncher.launch(requiredRuntimePermissions())
+                    permissionLauncher.launch(requiredRuntimePermissions(HostShareMode.WIFI_DIRECT))
                 } else if (!fresh.wifiEnabled) {
                     onShowMessage(
                         tr(
@@ -297,18 +395,24 @@ fun HostScreen(
         item(key = "hero_power") {
             HeroPowerCard(
                 status = hostState.status,
+                shareMode = activeShareMode,
                 errorMessage = hostState.errorMessage,
+                onSelectShareMode = ::handleSelectShareMode,
                 onTogglePower = ::handlePowerToggle,
             )
         }
 
-        if (envCheck.hasAnyIssue) {
+        if (envCheck.hasAnyIssue(activeShareMode)) {
             item(key = "permissions_card") {
                 PrerequisitesCard(
                     check = envCheck,
+                    shareMode = activeShareMode,
                     onRequestPermissions = {
                         pendingStartAfterPermissions = false
-                        permissionLauncher.launch(requiredRuntimePermissions())
+                        val perms = requiredRuntimePermissions(activeShareMode)
+                        if (perms.isNotEmpty()) {
+                            permissionLauncher.launch(perms)
+                        }
                     },
                     onOpenWifiSettings = {
                         runCatching {
@@ -327,20 +431,29 @@ fun HostScreen(
         item(key = "credentials_card") {
             CredentialsCard(
                 isRunning = isRunning,
+                shareMode = activeShareMode,
                 ssid = displaySsid,
                 passphrase = displayPassphrase,
                 ipAddress = displayIp,
                 port = displayPort,
+                pacUrl = displayPacUrl,
+                localIpAddresses = hostState.localIpAddresses,
                 showPassword = showPassword,
                 onTogglePassword = { showPassword = !showPassword },
                 onCopy = ::copyField,
+                onSelectInterfaceIp = { ip ->
+                    selectedTetherIp = ip
+                    copyField("IP", ip)
+                },
                 onShowQr = { showQrDialog = true },
+                onOpenTetheringSettings = { openTetheringSettings(context) },
             )
         }
 
         item(key = "stats_card") {
             RealtimeStatsCard(
                 hostState = hostState,
+                shareMode = activeShareMode,
                 uptimeMs = uptimeMs,
             )
         }
@@ -348,9 +461,11 @@ fun HostScreen(
         item(key = "quick_guide") {
             QuickConnectGuideCard(
                 expanded = guideExpanded,
+                shareMode = activeShareMode,
                 ssid = displaySsid,
                 ipAddress = displayIp,
                 port = displayPort,
+                pacUrl = displayPacUrl,
                 onToggleExpanded = { guideExpanded = !guideExpanded },
             )
         }
@@ -360,26 +475,31 @@ fun HostScreen(
         }
     }
 
-    if (showQrDialog) {
+    if (showQrDialog && activeShareMode == HostShareMode.WIFI_DIRECT) {
         WifiQrCodeDialog(
             ssid = displaySsid,
             passphrase = displayPassphrase,
             ipAddress = displayIp,
             port = displayPort,
+            pacUrl = displayPacUrl,
             onDismiss = { showQrDialog = false },
         )
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun HeroPowerCard(
     status: ServiceStatus,
+    shareMode: HostShareMode,
     errorMessage: String?,
+    onSelectShareMode: (HostShareMode) -> Unit,
     onTogglePower: () -> Unit,
 ) {
     val isRunning = status == ServiceStatus.RUNNING
     val isStarting = status == ServiceStatus.STARTING
     val isError = status == ServiceStatus.ERROR
+    val isNativeTethering = shareMode == HostShareMode.NATIVE_TETHERING
 
     val ringColor by animateColorAsState(
         targetValue = when (status) {
@@ -423,6 +543,11 @@ private fun HeroPowerCard(
         label = "pulseScale",
     )
 
+    val modes = listOf(
+        HostShareMode.WIFI_DIRECT to "Wi-Fi Direct",
+        HostShareMode.NATIVE_TETHERING to tr("Tethering Nativo", "Native Tethering"),
+    )
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.large,
@@ -432,20 +557,52 @@ private fun HeroPowerCard(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 22.dp),
+                .padding(horizontal = 20.dp, vertical = 18.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            SingleChoiceSegmentedButtonRow(
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                modes.forEachIndexed { index, (mode, label) ->
+                    SegmentedButton(
+                        selected = shareMode == mode,
+                        onClick = { onSelectShareMode(mode) },
+                        shape = SegmentedButtonDefaults.itemShape(
+                            index = index,
+                            count = modes.size,
+                        ),
+                        label = {
+                            Text(
+                                text = label,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        },
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
             StatusPill(
                 label = when (status) {
-                    ServiceStatus.RUNNING -> tr("Router Activo", "Router Active")
-                    ServiceStatus.STARTING -> tr("Iniciando Wi-Fi Direct...", "Starting Wi-Fi Direct...")
+                    ServiceStatus.RUNNING -> if (isNativeTethering) {
+                        tr("Proxy Tethering Activo", "Native Tethering Active")
+                    } else {
+                        tr("Router Activo", "Router Active")
+                    }
+                    ServiceStatus.STARTING -> if (isNativeTethering) {
+                        tr("Iniciando Proxy...", "Starting Proxy...")
+                    } else {
+                        tr("Iniciando Wi-Fi Direct...", "Starting Wi-Fi Direct...")
+                    }
                     ServiceStatus.ERROR -> tr("Error de inicio", "Startup Error")
                     ServiceStatus.STOPPED -> tr("Router Detenido", "Router Stopped")
                 },
                 dotColor = ringColor,
             )
 
-            Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(18.dp))
 
             Box(
                 contentAlignment = Alignment.Center,
@@ -504,18 +661,39 @@ private fun HeroPowerCard(
 
             Text(
                 text = when (status) {
-                    ServiceStatus.RUNNING -> tr(
-                        "Compartiendo la conexión actual mediante proxy híbrido HTTP + SOCKS5",
-                        "Sharing your current internet connection via HTTP + SOCKS5 hybrid proxy",
-                    )
-                    ServiceStatus.STARTING -> tr(
-                        "Creando grupo Wi-Fi Direct y abriendo el puerto del proxy...",
-                        "Creating Wi-Fi Direct group and binding proxy port...",
-                    )
-                    ServiceStatus.STOPPED -> tr(
-                        "Pulsa ENCENDER para compartir internet por Wi-Fi Direct sin root",
-                        "Tap START to share internet over Wi-Fi Direct without root",
-                    )
+                    ServiceStatus.RUNNING -> if (isNativeTethering) {
+                        tr(
+                            "Proxy tunelizado activo sobre Zona Wi-Fi / USB nativo (sin VPN en ningún teléfono)",
+                            "Tunneled proxy active over native Hotspot / USB Tethering (no VPN app needed)",
+                        )
+                    } else {
+                        tr(
+                            "Compartiendo la conexión actual mediante proxy híbrido HTTP/PAC + SOCKS4/5",
+                            "Sharing your current internet connection via HTTP/PAC + SOCKS4/5 hybrid proxy",
+                        )
+                    }
+                    ServiceStatus.STARTING -> if (isNativeTethering) {
+                        tr(
+                            "Abriendo puerto del proxy y detectando interfaces de tethering...",
+                            "Binding proxy port and scanning tethering interfaces...",
+                        )
+                    } else {
+                        tr(
+                            "Creando grupo Wi-Fi Direct y abriendo el puerto del proxy...",
+                            "Creating Wi-Fi Direct group and binding proxy port...",
+                        )
+                    }
+                    ServiceStatus.STOPPED -> if (isNativeTethering) {
+                        tr(
+                            "Usa tu Zona Wi-Fi o Tethering USB nativo + proxy tunelizado (sin VPN en ningún teléfono)",
+                            "Uses Android's native Hotspot or USB Tethering + tunneled proxy (no VPN needed)",
+                        )
+                    } else {
+                        tr(
+                            "Pulsa ENCENDER para compartir internet por Wi-Fi Direct sin root",
+                            "Tap START to share internet over Wi-Fi Direct without root",
+                        )
+                    }
                     ServiceStatus.ERROR -> tr(
                         "No se pudo iniciar el servicio. Revisa los permisos o reintenta.",
                         "Could not start the service. Check permissions or retry.",
@@ -590,10 +768,13 @@ private fun StatusPill(
 @Composable
 private fun PrerequisitesCard(
     check: HostEnvironmentCheck,
+    shareMode: HostShareMode,
     onRequestPermissions: () -> Unit,
     onOpenWifiSettings: () -> Unit,
     onOpenLocationSettings: () -> Unit,
 ) {
+    val isNativeTethering = shareMode == HostShareMode.NATIVE_TETHERING
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.medium,
@@ -616,83 +797,108 @@ private fun PrerequisitesCard(
                     tint = RouterStatusColors.WarningAmber,
                 )
                 Text(
-                    text = tr("Requisitos pendientes", "Action required"),
+                    text = if (isNativeTethering) {
+                        tr("Permiso opcional", "Optional permission")
+                    } else {
+                        tr("Requisitos pendientes", "Action required")
+                    },
                     style = MaterialTheme.typography.titleSmall,
                     color = RouterStatusColors.WarningAmber,
                 )
             }
 
-            if (check.missingWifiDirectPermission || check.missingNotificationPermission) {
-                val permDesc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    tr(
-                        "Android 13+ requiere permisos de Dispositivos Wi-Fi cercanos y Notificaciones para operar en segundo plano.",
-                        "Android 13+ requires Nearby Wi-Fi Devices and Notifications permissions to run in the background.",
-                    )
-                } else {
-                    tr(
-                        "Android 8–12 requiere el permiso de Ubicación precisa para crear redes Wi-Fi Direct.",
-                        "Android 8–12 requires Fine Location permission to create Wi-Fi Direct networks.",
-                    )
-                }
-                Text(
-                    text = permDesc,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Button(
-                    onClick = onRequestPermissions,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Icon(Icons.Rounded.Security, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text(tr("Conceder permisos", "Grant permissions"))
-                }
-            }
-
-            if (!check.wifiEnabled) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Row(
-                        modifier = Modifier.weight(1f),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.WifiOff,
-                            contentDescription = null,
-                            tint = RouterStatusColors.WarningAmber,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Text(
-                            text = tr("El Wi-Fi está desactivado", "Wi-Fi is turned off"),
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                    TextButton(onClick = onOpenWifiSettings) {
-                        Text(tr("Activar Wi-Fi", "Enable Wi-Fi"))
-                    }
-                }
-            }
-
-            if (check.needsLocationServices) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
+            if (isNativeTethering) {
+                if (check.missingNotificationPermission) {
                     Text(
                         text = tr(
-                            "Ubicación desactivada (necesaria en Android < 13)",
-                            "Location is off (required on Android < 13)",
+                            "Concede el permiso de Notificaciones (opcional) para ver el estado y velocidad del proxy en segundo plano.",
+                            "Grant Notifications permission (optional) to view live proxy status and speed in the background.",
                         ),
                         style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.weight(1f),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    TextButton(onClick = onOpenLocationSettings) {
-                        Text(tr("Abrir", "Open"))
+                    Button(
+                        onClick = onRequestPermissions,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(Icons.Rounded.Security, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text(tr("Permitir notificaciones", "Allow notifications"))
+                    }
+                }
+            } else {
+                if (check.missingWifiDirectPermission || check.missingNotificationPermission) {
+                    val permDesc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        tr(
+                            "Android 13+ requiere permisos de Dispositivos Wi-Fi cercanos y Notificaciones para operar en segundo plano.",
+                            "Android 13+ requires Nearby Wi-Fi Devices and Notifications permissions to run in the background.",
+                        )
+                    } else {
+                        tr(
+                            "Android 8–12 requiere el permiso de Ubicación precisa para crear redes Wi-Fi Direct.",
+                            "Android 8–12 requires Fine Location permission to create Wi-Fi Direct networks.",
+                        )
+                    }
+                    Text(
+                        text = permDesc,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Button(
+                        onClick = onRequestPermissions,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(Icons.Rounded.Security, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text(tr("Conceder permisos", "Grant permissions"))
+                    }
+                }
+
+                if (!check.wifiEnabled) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Row(
+                            modifier = Modifier.weight(1f),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.WifiOff,
+                                contentDescription = null,
+                                tint = RouterStatusColors.WarningAmber,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Text(
+                                text = tr("El Wi-Fi está desactivado", "Wi-Fi is turned off"),
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        TextButton(onClick = onOpenWifiSettings) {
+                            Text(tr("Activar Wi-Fi", "Enable Wi-Fi"))
+                        }
+                    }
+                }
+
+                if (check.needsLocationServices) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = tr(
+                                "Ubicación desactivada (necesaria en Android < 13)",
+                                "Location is off (required on Android < 13)",
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = onOpenLocationSettings) {
+                            Text(tr("Abrir", "Open"))
+                        }
                     }
                 }
             }
@@ -700,18 +906,26 @@ private fun PrerequisitesCard(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun CredentialsCard(
     isRunning: Boolean,
+    shareMode: HostShareMode,
     ssid: String,
     passphrase: String,
     ipAddress: String,
     port: Int,
+    pacUrl: String,
+    localIpAddresses: List<String>,
     showPassword: Boolean,
     onTogglePassword: () -> Unit,
     onCopy: (label: String, value: String) -> Unit,
+    onSelectInterfaceIp: (String) -> Unit,
     onShowQr: () -> Unit,
+    onOpenTetheringSettings: () -> Unit,
 ) {
+    val isNativeTethering = shareMode == HostShareMode.NATIVE_TETHERING
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.medium,
@@ -737,7 +951,11 @@ private fun CredentialsCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = tr("Credenciales Wi-Fi Direct y Proxy", "Wi-Fi Direct & Proxy Credentials"),
+                    text = if (isNativeTethering) {
+                        tr("Proxy Tethering Nativo", "Native Tethering Proxy")
+                    } else {
+                        tr("Credenciales Wi-Fi Direct y Proxy", "Wi-Fi Direct & Proxy Credentials")
+                    },
                     style = MaterialTheme.typography.titleMedium,
                 )
                 Surface(
@@ -761,33 +979,35 @@ private fun CredentialsCard(
                 }
             }
 
-            CredentialRow(
-                label = "SSID",
-                value = ssid,
-                onCopy = { onCopy("SSID", ssid) },
-            )
+            if (!isNativeTethering) {
+                CredentialRow(
+                    label = "SSID",
+                    value = ssid,
+                    onCopy = { onCopy("SSID", ssid) },
+                )
 
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
 
-            CredentialRow(
-                label = tr("Contraseña", "Passphrase"),
-                value = if (showPassword) passphrase else "•".repeat(passphrase.length.coerceIn(8, 14)),
-                trailingExtra = {
-                    IconButton(onClick = onTogglePassword) {
-                        Icon(
-                            imageVector = if (showPassword) {
-                                Icons.Rounded.VisibilityOff
-                            } else {
-                                Icons.Rounded.Visibility
-                            },
-                            contentDescription = tr("Mostrar u ocultar", "Toggle visibility"),
-                        )
-                    }
-                },
-                onCopy = { onCopy(tr("Contraseña", "Passphrase"), passphrase) },
-            )
+                CredentialRow(
+                    label = tr("Contraseña", "Passphrase"),
+                    value = if (showPassword) passphrase else "•".repeat(passphrase.length.coerceIn(8, 14)),
+                    trailingExtra = {
+                        IconButton(onClick = onTogglePassword) {
+                            Icon(
+                                imageVector = if (showPassword) {
+                                    Icons.Rounded.VisibilityOff
+                                } else {
+                                    Icons.Rounded.Visibility
+                                },
+                                contentDescription = tr("Mostrar u ocultar", "Toggle visibility"),
+                            )
+                        }
+                    },
+                    onCopy = { onCopy(tr("Contraseña", "Passphrase"), passphrase) },
+                )
 
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -861,18 +1081,126 @@ private fun CredentialsCard(
                 }
             }
 
-            FilledTonalButton(
-                onClick = onShowQr,
+            Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = MaterialTheme.shapes.small,
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.QrCode2,
-                    contentDescription = null,
-                    modifier = Modifier.size(20.dp),
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(tr("Mostrar código QR Wi-Fi", "Show Wi-Fi QR Code"))
+                Row(
+                    modifier = Modifier.padding(start = 12.dp, top = 8.dp, bottom = 8.dp, end = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Link,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(14.dp),
+                            )
+                            Text(
+                                text = tr("URL Auto-Proxy (PAC)", "Auto-Proxy URL (PAC)"),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Text(
+                            text = pacUrl,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        if (isNativeTethering) {
+                            Text(
+                                text = tr(
+                                    "Android Wi-Fi → Proxy → Configuración automática",
+                                    "Android Wi-Fi → Proxy → Auto-Config",
+                                ),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    IconButton(onClick = { onCopy("PAC URL", pacUrl) }) {
+                        Icon(
+                            imageVector = Icons.Rounded.ContentCopy,
+                            contentDescription = tr("Copiar URL PAC", "Copy PAC URL"),
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+            }
+
+            if (isNativeTethering && localIpAddresses.size > 1) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        text = tr(
+                            "Interfaces detectadas (toca para seleccionar y copiar):",
+                            "Detected interfaces (tap to select & copy):",
+                        ),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        localIpAddresses.forEach { entry ->
+                            val chipIp = extractIpFromInterfaceEntry(entry)
+                            FilterChip(
+                                selected = chipIp == ipAddress,
+                                onClick = { onSelectInterfaceIp(chipIp) },
+                                label = {
+                                    Text(
+                                        text = entry,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontFamily = FontFamily.Monospace,
+                                    )
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (isNativeTethering) {
+                FilledTonalButton(
+                    onClick = onOpenTetheringSettings,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.small,
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.WifiTethering,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(tr("Abrir Zona Wi-Fi / Tethering", "Open Hotspot / Tethering"))
+                }
+            } else {
+                FilledTonalButton(
+                    onClick = onShowQr,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.small,
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.QrCode2,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(tr("Mostrar código QR Wi-Fi", "Show Wi-Fi QR Code"))
+                }
             }
         }
     }
@@ -922,10 +1250,12 @@ private fun CredentialRow(
 @Composable
 private fun RealtimeStatsCard(
     hostState: HostServiceState,
+    shareMode: HostShareMode,
     uptimeMs: Long,
 ) {
     val traffic = hostState.traffic
     val totalBytes = traffic.bytesDown + traffic.bytesUp
+    val isNativeTethering = shareMode == HostShareMode.NATIVE_TETHERING
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -996,8 +1326,16 @@ private fun RealtimeStatsCard(
                     modifier = Modifier.weight(1f),
                     icon = Icons.Rounded.Devices,
                     iconTint = RouterStatusColors.WarningAmber,
-                    label = tr("Clientes Wi-Fi", "Wi-Fi Clients"),
-                    value = hostState.connectedWifiClients.toString(),
+                    label = if (isNativeTethering) {
+                        tr("Conexiones activas", "Active Conns")
+                    } else {
+                        tr("Clientes Wi-Fi", "Wi-Fi Clients")
+                    },
+                    value = if (isNativeTethering) {
+                        traffic.activeConnections.toString()
+                    } else {
+                        hostState.connectedWifiClients.toString()
+                    },
                     subtitle = tr("Tiempo: ", "Uptime: ") + Formatters.formatDuration(uptimeMs),
                 )
             }
@@ -1084,11 +1422,15 @@ private fun MetricTile(
 @Composable
 private fun QuickConnectGuideCard(
     expanded: Boolean,
+    shareMode: HostShareMode,
     ssid: String,
     ipAddress: String,
     port: Int,
+    pacUrl: String,
     onToggleExpanded: () -> Unit,
 ) {
+    val isNativeTethering = shareMode == HostShareMode.NATIVE_TETHERING
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -1101,6 +1443,7 @@ private fun QuickConnectGuideCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1133,31 +1476,50 @@ private fun QuickConnectGuideCard(
                 )
             }
 
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+            ) {
+                Text(
+                    text = "HTTP/HTTPS • PAC • SOCKS4/4a • SOCKS5 TCP+UDP",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                )
+            }
+
             AnimatedVisibility(visible = expanded) {
                 Column(
-                    modifier = Modifier.padding(top = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Text(
+                        text = if (isNativeTethering) {
+                            tr(
+                                "1. Activa la Zona Wi-Fi (Hotspot) o Tethering USB de este teléfono y conecta el 2.º teléfono o PC a esa red.",
+                                "1. Enable this phone's native Hotspot or USB Tethering and connect the 2nd phone or PC to it.",
+                            )
+                        } else {
+                            tr(
+                                "1. En el otro teléfono o PC, conéctate al Wi-Fi \"$ssid\" (o escanea el código QR).",
+                                "1. On the 2nd phone or PC, connect to Wi-Fi \"$ssid\" (or scan the QR code).",
+                            )
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
                         text = tr(
-                            "1. En el otro teléfono o PC, conéctate al Wi-Fi \"$ssid\" (o escanea el código QR).",
-                            "1. On the 2nd phone or PC, connect to Wi-Fi \"$ssid\" (or scan the QR code).",
+                            "2. En los ajustes de esa red Wi-Fi del otro dispositivo, elige Proxy → Manual (IP $ipAddress y Puerto $port) O Proxy → Auto-Config (PAC) con la URL $pacUrl. Funciona sin instalar ninguna app ni VPN en ningún teléfono.",
+                            "2. In that Wi-Fi network's settings on the 2nd device, choose Proxy → Manual (IP $ipAddress and Port $port) OR Proxy → Auto-Config (PAC) with URL $pacUrl. Works without installing any VPN app on either phone.",
                         ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Text(
                         text = tr(
-                            "2. Abre los ajustes de esa red Wi-Fi → Proxy → Manual y escribe IP $ipAddress y Puerto $port.",
-                            "2. Open that Wi-Fi network's settings → Proxy → Manual and enter IP $ipAddress and Port $port.",
-                        ),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Text(
-                        text = tr(
-                            "3. Para juegos, llamadas VoIP o apps UDP en un 2.º Android, instala DirectRouter y usa la pestaña Cliente VPN.",
-                            "3. For games, VoIP calls, or UDP apps on a 2nd Android phone, install DirectRouter and use the VPN Client tab.",
+                            "3. Para juegos, llamadas VoIP o apps UDP en un 2.º Android, opcionalmente puedes instalar DirectRouter y usar la pestaña Cliente VPN.",
+                            "3. For games, VoIP calls, or UDP apps on a 2nd Android phone, you can optionally install DirectRouter and use the VPN Client tab.",
                         ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.primary,
@@ -1174,6 +1536,7 @@ private fun WifiQrCodeDialog(
     passphrase: String,
     ipAddress: String,
     port: Int,
+    pacUrl: String,
     onDismiss: () -> Unit,
 ) {
     val payload = remember(ssid, passphrase) {
@@ -1195,7 +1558,7 @@ private fun WifiQrCodeDialog(
             Column(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 Surface(
                     shape = RoundedCornerShape(16.dp),
@@ -1239,6 +1602,13 @@ private fun WifiQrCodeDialog(
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    text = "PAC: $pacUrl",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.primary,
                     textAlign = TextAlign.Center,
                 )
             }

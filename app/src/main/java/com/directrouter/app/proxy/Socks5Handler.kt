@@ -1,7 +1,7 @@
 package com.directrouter.app.proxy
 
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -20,7 +20,6 @@ import java.net.Socket
 import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 
 internal object Socks5Handler {
@@ -43,15 +42,8 @@ internal object Socks5Handler {
     private const val REP_ADDRESS_TYPE_NOT_SUPPORTED = 0x08
 
     private const val MAX_UDP_PACKET_SIZE = 65_535
-    private const val DNS_CACHE_TTL_MS = 60_000L
-    private const val DNS_CACHE_MAX_SIZE = 256
 
-    private data class CachedDnsEntry(
-        val address: InetAddress,
-        val expiresAtMs: Long,
-    )
-
-    private val dnsCache = ConcurrentHashMap<String, CachedDnsEntry>()
+    private val IPV4_LOOPBACK: InetAddress = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
 
     private data class Socks5Address(
         val atyp: Int,
@@ -66,6 +58,7 @@ internal object Socks5Handler {
         clientOut: OutputStream,
         statsTracker: TrafficStatsTracker,
         @Suppress("UNUSED_PARAMETER") scope: CoroutineScope,
+        dispatcher: CoroutineDispatcher,
     ) {
         if (!negotiateAuth(clientIn, clientOut)) {
             return
@@ -134,6 +127,7 @@ internal object Socks5Handler {
                 clientIn = clientIn,
                 clientOut = clientOut,
                 statsTracker = statsTracker,
+                dispatcher = dispatcher,
             )
 
             CMD_UDP_ASSOCIATE -> handleUdpAssociate(
@@ -142,6 +136,7 @@ internal object Socks5Handler {
                 clientIn = clientIn,
                 clientOut = clientOut,
                 statsTracker = statsTracker,
+                dispatcher = dispatcher,
             )
 
             else -> {
@@ -177,40 +172,35 @@ internal object Socks5Handler {
         clientIn: InputStream,
         clientOut: OutputStream,
         statsTracker: TrafficStatsTracker,
+        dispatcher: CoroutineDispatcher,
     ) {
-        val targetAddress = try {
-            destination.resolvedAddress ?: resolveHostCached(destination.host)
-        } catch (_: UnknownHostException) {
-            sendReply(clientOut, REP_HOST_UNREACHABLE, null, 0)
-            return
+        val connectResult = if (destination.resolvedAddress != null) {
+            OutboundConnector.connectWithResult(destination.resolvedAddress, destination.port)
+        } else {
+            OutboundConnector.connectWithResult(destination.host, destination.port)
         }
 
-        val remoteSocket = Socket()
-        try {
-            remoteSocket.tcpNoDelay = true
-            remoteSocket.connect(
-                InetSocketAddress(targetAddress, destination.port),
-                HybridProxyServer.CONNECT_TIMEOUT_MS,
-            )
-        } catch (e: IOException) {
-            runCatching { remoteSocket.close() }
-            val replyCode = when (e) {
-                is ConnectException -> REP_CONNECTION_REFUSED
-                is UnknownHostException,
-                is NoRouteToHostException,
-                is SocketTimeoutException,
-                -> REP_HOST_UNREACHABLE
-                else -> REP_GENERAL_FAILURE
+        val remoteSocket = when (connectResult) {
+            is OutboundConnector.ConnectResult.Success -> connectResult.socket
+            is OutboundConnector.ConnectResult.Failure -> {
+                val replyCode = when (connectResult.error) {
+                    is ConnectException -> REP_CONNECTION_REFUSED
+                    is UnknownHostException,
+                    is NoRouteToHostException,
+                    is SocketTimeoutException,
+                    -> REP_HOST_UNREACHABLE
+                    else -> REP_GENERAL_FAILURE
+                }
+                sendReply(clientOut, replyCode, null, 0)
+                return
             }
-            sendReply(clientOut, replyCode, null, 0)
-            return
         }
 
         try {
             sendReply(
                 clientOut = clientOut,
                 replyCode = REP_SUCCEEDED,
-                bindAddress = remoteSocket.localAddress,
+                bindAddress = OutboundConnector.unwrapIpv4Mapped(remoteSocket.localAddress),
                 bindPort = remoteSocket.localPort,
             )
 
@@ -222,6 +212,7 @@ internal object Socks5Handler {
                 remoteIn = remoteSocket.getInputStream(),
                 remoteOut = remoteSocket.getOutputStream(),
                 statsTracker = statsTracker,
+                dispatcher = dispatcher,
             )
         } finally {
             runCatching { remoteSocket.close() }
@@ -234,8 +225,9 @@ internal object Socks5Handler {
         clientIn: InputStream,
         clientOut: OutputStream,
         statsTracker: TrafficStatsTracker,
+        dispatcher: CoroutineDispatcher,
     ) {
-        val bindAddr = clientSocket.localAddress
+        val bindAddr = normalizeLocalBindAddress(clientSocket.localAddress)
         val clientUdpSocket = try {
             DatagramSocket(0, bindAddr)
         } catch (_: IOException) {
@@ -277,7 +269,7 @@ internal object Socks5Handler {
             runCatching { clientSocket.soTimeout = 0 }
 
             coroutineScope {
-                val clientToRemoteJob = launch(Dispatchers.IO) {
+                val clientToRemoteJob = launch(dispatcher) {
                     val receiveBuffer = ByteArray(MAX_UDP_PACKET_SIZE)
                     while (isActive && !clientUdpSocket.isClosed) {
                         val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
@@ -297,7 +289,7 @@ internal object Socks5Handler {
                         if (dataLen < 0 || parsed.port !in 1..65535) continue
 
                         val targetAddr = parsed.resolvedAddress ?: try {
-                            resolveHostCached(parsed.host)
+                            OutboundConnector.resolveFirst(parsed.host)
                         } catch (_: IOException) {
                             continue
                         }
@@ -320,7 +312,7 @@ internal object Socks5Handler {
                     }
                 }
 
-                val remoteToClientJob = launch(Dispatchers.IO) {
+                val remoteToClientJob = launch(dispatcher) {
                     val receiveBuffer = ByteArray(MAX_UDP_PACKET_SIZE)
                     while (isActive && !remoteUdpSocket.isClosed) {
                         val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
@@ -378,6 +370,20 @@ internal object Socks5Handler {
             runCatching { clientUdpSocket.close() }
             runCatching { remoteUdpSocket.close() }
         }
+    }
+
+    internal fun normalizeLocalBindAddress(addr: InetAddress): InetAddress {
+        val unwrapped = OutboundConnector.unwrapIpv4Mapped(addr)
+        if (unwrapped.isAnyLocalAddress) {
+            return IPV4_LOOPBACK
+        }
+        if (unwrapped is Inet4Address) {
+            return unwrapped
+        }
+        if (unwrapped.isLoopbackAddress) {
+            return IPV4_LOOPBACK
+        }
+        return IPV4_LOOPBACK
     }
 
     internal data class ParsedUdpHeader(
@@ -443,7 +449,8 @@ internal object Socks5Handler {
         payload: ByteArray,
         payloadLength: Int,
     ): ByteArray? {
-        val addrBytes = sourceAddress.address
+        val unwrapped = OutboundConnector.unwrapIpv4Mapped(sourceAddress)
+        val addrBytes = unwrapped.address
         val atyp = when (addrBytes.size) {
             4 -> ATYP_IPV4
             16 -> ATYP_IPV6
@@ -470,7 +477,8 @@ internal object Socks5Handler {
         bindAddress: InetAddress?,
         bindPort: Int,
     ) {
-        val rawAddr = bindAddress?.address
+        val unwrapped = bindAddress?.let { OutboundConnector.unwrapIpv4Mapped(it) }
+        val rawAddr = unwrapped?.address
         val (atyp, addrBytes) = when (rawAddr?.size) {
             4 -> ATYP_IPV4 to rawAddr
             16 -> ATYP_IPV6 to rawAddr
@@ -490,28 +498,6 @@ internal object Socks5Handler {
             clientOut.write(reply)
             clientOut.flush()
         }
-    }
-
-    private fun resolveHostCached(host: String): InetAddress {
-        val now = System.currentTimeMillis()
-        val cached = dnsCache[host]
-        if (cached != null && cached.expiresAtMs > now) {
-            return cached.address
-        }
-
-        val candidates = InetAddress.getAllByName(host)
-        val resolved = candidates.firstOrNull { it is Inet4Address } ?: candidates.first()
-        if (dnsCache.size >= DNS_CACHE_MAX_SIZE) {
-            dnsCache.entries.removeIf { it.value.expiresAtMs <= now }
-            if (dnsCache.size >= DNS_CACHE_MAX_SIZE) {
-                dnsCache.clear()
-            }
-        }
-        dnsCache[host] = CachedDnsEntry(
-            address = resolved,
-            expiresAtMs = now + DNS_CACHE_TTL_MS,
-        )
-        return resolved
     }
 
     private fun readExact(input: InputStream, count: Int): ByteArray? {

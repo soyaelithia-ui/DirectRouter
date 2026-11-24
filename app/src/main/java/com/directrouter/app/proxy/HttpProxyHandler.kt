@@ -1,7 +1,7 @@
 package com.directrouter.app.proxy
 
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -9,8 +9,8 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.net.URI
 
 internal object HttpProxyHandler {
@@ -28,6 +28,8 @@ internal object HttpProxyHandler {
         "te",
         "trailers",
     )
+
+    private val PAC_PATHS = setOf("/proxy.pac", "/wpad.dat")
 
     private val RESPONSE_200_ESTABLISHED =
         "HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII)
@@ -62,6 +64,7 @@ internal object HttpProxyHandler {
         clientOut: OutputStream,
         statsTracker: TrafficStatsTracker,
         @Suppress("UNUSED_PARAMETER") scope: CoroutineScope,
+        dispatcher: CoroutineDispatcher,
     ) {
         val request = try {
             readHttpRequest(clientIn)
@@ -72,10 +75,86 @@ internal object HttpProxyHandler {
             return
         } ?: return
 
+        if (isPacRequest(request)) {
+            handlePacRequest(request, clientSocket, clientOut, statsTracker)
+            return
+        }
+
         if (request.method.equals("CONNECT", ignoreCase = true)) {
-            handleConnect(request, clientSocket, clientIn, clientOut, statsTracker)
+            handleConnect(request, clientSocket, clientIn, clientOut, statsTracker, dispatcher)
         } else {
-            handlePlainHttp(request, clientSocket, clientIn, clientOut, statsTracker)
+            handlePlainHttp(request, clientSocket, clientIn, clientOut, statsTracker, dispatcher)
+        }
+    }
+
+    private fun isPacRequest(request: ParsedHttpRequest): Boolean {
+        val method = request.method.uppercase()
+        if (method != "GET" && method != "HEAD") return false
+        if (!request.target.startsWith("/")) return false
+        val pathOnly = request.target.substringBefore('?').lowercase()
+        return pathOnly in PAC_PATHS
+    }
+
+    private fun handlePacRequest(
+        request: ParsedHttpRequest,
+        clientSocket: Socket,
+        clientOut: OutputStream,
+        statsTracker: TrafficStatsTracker,
+    ) {
+        val hostHeader = request.headers
+            .firstOrNull { it.first.equals("Host", ignoreCase = true) }
+            ?.second
+        val parsedHost = hostHeader?.let { parseAuthority(it, clientSocket.localPort)?.host }
+        val proxyHost = if (!parsedHost.isNullOrBlank()) {
+            stripIpv4MappedPrefix(parsedHost)
+        } else {
+            Socks5Handler.normalizeLocalBindAddress(clientSocket.localAddress).hostAddress ?: "127.0.0.1"
+        }
+        val formattedHost = if (proxyHost.contains(':') && !proxyHost.startsWith('[')) {
+            "[$proxyHost]"
+        } else {
+            proxyHost
+        }
+        val proxyPort = clientSocket.localPort
+
+        val pacBody = buildString {
+            append("function FindProxyForURL(url, host) {\n")
+            append("  if (isPlainHostName(host) || shExpMatch(host, \"*.local\") ||\n")
+            append("      isInNet(dnsResolve(host), \"127.0.0.0\", \"255.0.0.0\") ||\n")
+            append("      isInNet(dnsResolve(host), \"192.168.0.0\", \"255.255.0.0\") ||\n")
+            append("      isInNet(dnsResolve(host), \"10.0.0.0\", \"255.0.0.0\")) {\n")
+            append("    return \"DIRECT\";\n")
+            append("  }\n")
+            append("  return \"PROXY ").append(formattedHost).append(':').append(proxyPort).append("; DIRECT\";\n")
+            append("}\n")
+        }
+        val bodyBytes = pacBody.toByteArray(Charsets.UTF_8)
+        val headers = buildString {
+            append("HTTP/1.1 200 OK\r\n")
+            append("Content-Type: application/x-ns-proxy-autoconfig\r\n")
+            append("Cache-Control: no-cache\r\n")
+            append("Connection: close\r\n")
+            append("Content-Length: ").append(bodyBytes.size).append("\r\n\r\n")
+        }.toByteArray(Charsets.US_ASCII)
+
+        val isHead = request.method.equals("HEAD", ignoreCase = true)
+        runCatching {
+            clientOut.write(headers)
+            if (!isHead) {
+                clientOut.write(bodyBytes)
+            }
+            clientOut.flush()
+            val sent = headers.size.toLong() + if (isHead) 0L else bodyBytes.size.toLong()
+            statsTracker.addBytesDown(sent)
+        }
+    }
+
+    private fun stripIpv4MappedPrefix(host: String): String {
+        val lower = host.lowercase()
+        return if (lower.startsWith("::ffff:")) {
+            host.substring(7)
+        } else {
+            host
         }
     }
 
@@ -85,6 +164,7 @@ internal object HttpProxyHandler {
         clientIn: InputStream,
         clientOut: OutputStream,
         statsTracker: TrafficStatsTracker,
+        dispatcher: CoroutineDispatcher,
     ) {
         val hostPort = parseAuthority(request.target, DEFAULT_HTTPS_PORT)
         if (hostPort == null) {
@@ -92,7 +172,7 @@ internal object HttpProxyHandler {
             return
         }
 
-        val remoteSocket = connectOutbound(hostPort.host, hostPort.port)
+        val remoteSocket = OutboundConnector.connect(hostPort.host, hostPort.port)
         if (remoteSocket == null) {
             writeResponseQuietly(clientOut, RESPONSE_502_BAD_GATEWAY)
             return
@@ -110,6 +190,7 @@ internal object HttpProxyHandler {
                 remoteIn = remoteSocket.getInputStream(),
                 remoteOut = remoteSocket.getOutputStream(),
                 statsTracker = statsTracker,
+                dispatcher = dispatcher,
             )
         } finally {
             runCatching { remoteSocket.close() }
@@ -122,6 +203,7 @@ internal object HttpProxyHandler {
         clientIn: InputStream,
         clientOut: OutputStream,
         statsTracker: TrafficStatsTracker,
+        dispatcher: CoroutineDispatcher,
     ) {
         val target = resolveHttpTarget(request.target, request.headers)
         if (target == null) {
@@ -129,7 +211,7 @@ internal object HttpProxyHandler {
             return
         }
 
-        val remoteSocket = connectOutbound(target.host, target.port)
+        val remoteSocket = OutboundConnector.connect(target.host, target.port)
         if (remoteSocket == null) {
             writeResponseQuietly(clientOut, RESPONSE_502_BAD_GATEWAY)
             return
@@ -139,13 +221,31 @@ internal object HttpProxyHandler {
             val remoteOut = remoteSocket.getOutputStream()
             val remoteIn = remoteSocket.getInputStream()
 
-            val headerBytes = buildForwardedRequestHeader(request, target)
+            val isUpgrade = request.headers.any { (name, value) ->
+                name.equals("Upgrade", ignoreCase = true) && value.isNotBlank()
+            }
+
+            val headerBytes = buildForwardedRequestHeader(request, target, isUpgrade)
             remoteOut.write(headerBytes)
             remoteOut.flush()
             statsTracker.addBytesUp(headerBytes.size.toLong())
 
-            runCatching { clientSocket.soTimeout = 0 }
-            runCatching { remoteSocket.soTimeout = 0 }
+            if (isUpgrade) {
+                HybridProxyServer.relayTcpBidirectional(
+                    clientSocket = clientSocket,
+                    clientIn = clientIn,
+                    clientOut = clientOut,
+                    remoteSocket = remoteSocket,
+                    remoteIn = remoteIn,
+                    remoteOut = remoteOut,
+                    statsTracker = statsTracker,
+                    dispatcher = dispatcher,
+                )
+                return
+            }
+
+            runCatching { clientSocket.soTimeout = HybridProxyServer.RELAY_IDLE_TIMEOUT_MS }
+            runCatching { remoteSocket.soTimeout = HybridProxyServer.RELAY_IDLE_TIMEOUT_MS }
 
             val transferEncoding = request.headers
                 .firstOrNull { it.first.equals("Transfer-Encoding", ignoreCase = true) }
@@ -162,13 +262,13 @@ internal object HttpProxyHandler {
 
             coroutineScope {
                 val requestBodyJob = when {
-                    isChunked -> launch(Dispatchers.IO) {
+                    isChunked -> launch(dispatcher) {
                         runCatching {
                             copyChunkedBody(clientIn, remoteOut, statsTracker)
                         }
                     }
 
-                    contentLength > 0L -> launch(Dispatchers.IO) {
+                    contentLength > 0L -> launch(dispatcher) {
                         runCatching {
                             copyFixedLengthBody(clientIn, remoteOut, contentLength, statsTracker)
                         }
@@ -181,7 +281,11 @@ internal object HttpProxyHandler {
                 val buffer = ByteArray(HybridProxyServer.RELAY_BUFFER_SIZE)
                 try {
                     while (isActive) {
-                        val read = remoteIn.read(buffer)
+                        val read = try {
+                            remoteIn.read(buffer)
+                        } catch (_: SocketTimeoutException) {
+                            break
+                        }
                         if (read <= 0) break
                         clientOut.write(buffer, 0, read)
                         clientOut.flush()
@@ -213,6 +317,7 @@ internal object HttpProxyHandler {
     private fun buildForwardedRequestHeader(
         request: ParsedHttpRequest,
         target: HttpTarget,
+        isUpgrade: Boolean,
     ): ByteArray {
         val sb = StringBuilder(512)
         sb.append(request.method)
@@ -246,7 +351,11 @@ internal object HttpProxyHandler {
             sb.append("Host: ").append(hostValue).append("\r\n")
         }
 
-        sb.append("Connection: close\r\n\r\n")
+        if (isUpgrade) {
+            sb.append("Connection: Upgrade\r\n\r\n")
+        } else {
+            sb.append("Connection: close\r\n\r\n")
+        }
         return sb.toString().toByteArray(Charsets.ISO_8859_1)
     }
 
@@ -311,21 +420,6 @@ internal object HttpProxyHandler {
             output.write(crlf)
             output.flush()
             statsTracker.addBytesUp(crlf.size.toLong())
-        }
-    }
-
-    private fun connectOutbound(host: String, port: Int): Socket? {
-        val socket = Socket()
-        return try {
-            socket.tcpNoDelay = true
-            socket.connect(InetSocketAddress(host, port), HybridProxyServer.CONNECT_TIMEOUT_MS)
-            socket
-        } catch (_: IOException) {
-            runCatching { socket.close() }
-            null
-        } catch (_: IllegalArgumentException) {
-            runCatching { socket.close() }
-            null
         }
     }
 

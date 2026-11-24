@@ -141,6 +141,7 @@ private fun DirectRouterAppRoot(
                     settings = settings,
                     onStartRouter = { viewModel.startHostRouter(context) },
                     onStopRouter = { viewModel.stopHostRouter(context) },
+                    onSelectShareMode = viewModel::updateHostShareMode,
                     onShowMessage = ::showMessage,
                 )
 

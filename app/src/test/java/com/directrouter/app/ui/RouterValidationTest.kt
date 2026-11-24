@@ -1,6 +1,10 @@
 package com.directrouter.app.ui
 
+import com.directrouter.app.data.HostShareMode
+import com.directrouter.app.data.RouterSettings
 import com.directrouter.app.data.ValidationUtils
+import com.directrouter.app.host.HostServiceState
+import com.directrouter.app.ui.host.extractIpFromInterfaceEntry
 import com.directrouter.app.ui.util.Formatters
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -107,5 +111,31 @@ class RouterValidationTest {
         assertEquals("00:05:09", Formatters.formatDuration(309_000L))
         assertEquals("01:02:03", Formatters.formatDuration(3_723_000L))
         assertEquals("25:00:00", Formatters.formatDuration(90_000_000L))
+    }
+
+    @Test
+    fun routerSettings_defaultsToWifiDirectShareMode() {
+        val settings = RouterSettings()
+        assertEquals(HostShareMode.WIFI_DIRECT, settings.hostShareMode)
+    }
+
+    @Test
+    fun hostServiceState_buildsPacUrlFromIpAndPort() {
+        val defaultState = HostServiceState()
+        assertEquals("http://192.168.49.1:8080/proxy.pac", defaultState.pacUrl)
+
+        val tetherState = HostServiceState(
+            shareMode = HostShareMode.NATIVE_TETHERING,
+            ipAddress = "192.168.43.1",
+            port = 9090,
+        )
+        assertEquals("http://192.168.43.1:9090/proxy.pac", tetherState.pacUrl)
+    }
+
+    @Test
+    fun extractIpFromInterfaceEntry_parsesLabeledAndPlainEntries() {
+        assertEquals("192.168.43.1", extractIpFromInterfaceEntry("192.168.43.1 (ap0)"))
+        assertEquals("192.168.42.129", extractIpFromInterfaceEntry("192.168.42.129 (rndis0)"))
+        assertEquals("10.0.0.1", extractIpFromInterfaceEntry("  10.0.0.1  "))
     }
 }

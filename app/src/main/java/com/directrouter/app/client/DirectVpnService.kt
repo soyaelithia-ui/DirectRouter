@@ -25,6 +25,7 @@ import java.io.File
 import java.io.IOException
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -33,6 +34,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 class DirectVpnService : VpnService() {
 
@@ -129,12 +131,31 @@ class DirectVpnService : VpnService() {
                     )
                 }
 
-                registerWifiNetworkCallback()
+                val wifiReadyDeferred = if (initialWifi == null) {
+                    CompletableDeferred<Network?>()
+                } else {
+                    null
+                }
+                registerWifiNetworkCallback(wifiReadyDeferred)
 
                 // Pin outbound sockets from this app (hev-socks5-tunnel) to Wi-Fi Direct
                 // even when Android considers the Wi-Fi Direct network "without internet".
                 if (initialWifi != null) {
                     bindProcessToWifi(initialWifi)
+                } else if (wifiReadyDeferred != null) {
+                    val discoveredWifi = withTimeoutOrNull(WIFI_DISCOVERY_WAIT_MS) {
+                        wifiReadyDeferred.await()
+                    } ?: findActiveWifiNetwork()
+                    if (discoveredWifi != null) {
+                        activeWifiNetwork = discoveredWifi
+                        bindProcessToWifi(discoveredWifi)
+                        ClientVpnStateHolder.update { current ->
+                            current.copy(
+                                wifiConnected = true,
+                                wifiNetworkLabel = describeNetwork(discoveredWifi),
+                            )
+                        }
+                    }
                 }
 
                 val builder = Builder()
@@ -142,8 +163,9 @@ class DirectVpnService : VpnService() {
                     .setMtu(TUN_MTU)
                     .addAddress(TUN_IPV4_ADDRESS, 32)
                     .addRoute("0.0.0.0", 0)
-                    .addDnsServer(DNS_PRIMARY)
-                    .addDnsServer(DNS_SECONDARY)
+                    .addAddress(TUN_IPV6_ADDRESS, 128)
+                    .addRoute("::", 0)
+                    .addDnsServer(MAPDNS_ADDRESS)
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     builder.setMetered(false)
@@ -156,10 +178,6 @@ class DirectVpnService : VpnService() {
                     Log.w(TAG, "Unable to exclude self package from VPN", e)
                 }
 
-                if (initialWifi != null) {
-                    builder.setUnderlyingNetworks(arrayOf(initialWifi))
-                }
-
                 val pfd = builder.establish()
                 if (pfd == null) {
                     failAndStop("Permiso VPN no concedido o interfaz TUN no disponible.")
@@ -167,12 +185,14 @@ class DirectVpnService : VpnService() {
                 }
                 tunInterface = pfd
 
-                if (initialWifi != null) {
-                    try {
-                        setUnderlyingNetworks(arrayOf(initialWifi))
-                    } catch (e: Exception) {
-                        Log.w(TAG, "setUnderlyingNetworks failed after establish", e)
-                    }
+                // Do NOT bind underlyingNetworks to an unvalidated Wi-Fi Direct network:
+                // on Android 10-15 that causes ConnectivityService to mark the VPN itself as
+                // unvalidated/no-internet. Passing null lets the VPN stay healthy while
+                // bindProcessToNetwork + addDisallowedApplication keep hev sockets on Wi-Fi.
+                try {
+                    setUnderlyingNetworks(null)
+                } catch (e: Exception) {
+                    Log.w(TAG, "setUnderlyingNetworks(null) failed after establish", e)
                 }
 
                 val configFile = writeHevConfig(hostIp, hostPort)
@@ -252,13 +272,23 @@ class DirectVpnService : VpnService() {
         val yaml = buildString {
             appendLine("tunnel:")
             appendLine("  mtu: $TUN_MTU")
-            appendLine("  ipv4: $TUN_IPV4_ADDRESS")
+            appendLine("  ipv4: '$TUN_IPV4_ADDRESS'")
+            appendLine("  ipv6: '$TUN_IPV6_ADDRESS'")
             appendLine("socks5:")
             appendLine("  port: $hostPort")
-            appendLine("  address: $sanitizedIp")
+            appendLine("  address: '$sanitizedIp'")
             appendLine("  udp: 'udp'")
+            appendLine("mapdns:")
+            appendLine("  address: $MAPDNS_ADDRESS")
+            appendLine("  port: $MAPDNS_PORT")
+            appendLine("  network: $MAPDNS_NETWORK")
+            appendLine("  netmask: $MAPDNS_NETMASK")
+            appendLine("  cache-size: $MAPDNS_CACHE_SIZE")
             appendLine("misc:")
             appendLine("  task-stack-size: 81920")
+            appendLine("  connect-timeout: 10000")
+            appendLine("  tcp-read-write-timeout: 300000")
+            appendLine("  udp-read-write-timeout: 60000")
             appendLine("  log-level: warn")
         }
         val configFile = File(filesDir, HEV_CONFIG_FILENAME)
@@ -281,15 +311,18 @@ class DirectVpnService : VpnService() {
         }
     }
 
-    private fun registerWifiNetworkCallback() {
+    private fun registerWifiNetworkCallback(
+        wifiReadyDeferred: CompletableDeferred<Network?>? = null,
+    ) {
         val cm = connectivityManager ?: return
         if (wifiNetworkCallback != null) return
 
-        // Explicitly remove NET_CAPABILITY_INTERNET so Android notifies us of Wi-Fi Direct
-        // networks that lack direct internet access / NET_CAPABILITY_VALIDATED.
+        // Request an active OS lease on Wi-Fi without requiring INTERNET or VALIDATED
+        // capabilities so Android does not drop the "no-internet" Wi-Fi Direct connection.
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .removeCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
             .build()
 
         val callback = object : ConnectivityManager.NetworkCallback() {
@@ -299,13 +332,7 @@ class DirectVpnService : VpnService() {
 
                 activeWifiNetwork = network
                 bindProcessToWifi(network)
-                if (tunInterface != null) {
-                    try {
-                        setUnderlyingNetworks(arrayOf(network))
-                    } catch (e: Exception) {
-                        Log.w(TAG, "setUnderlyingNetworks(wifi) failed", e)
-                    }
-                }
+                wifiReadyDeferred?.complete(network)
                 val label = describeNetwork(network)
                 ClientVpnStateHolder.update { current ->
                     current.copy(
@@ -320,13 +347,6 @@ class DirectVpnService : VpnService() {
                 val fallbackWifi = findActiveWifiNetwork()
                 activeWifiNetwork = fallbackWifi
                 bindProcessToWifi(fallbackWifi)
-                if (tunInterface != null) {
-                    try {
-                        setUnderlyingNetworks(fallbackWifi?.let { arrayOf(it) })
-                    } catch (e: Exception) {
-                        Log.w(TAG, "setUnderlyingNetworks onLost update failed", e)
-                    }
-                }
                 ClientVpnStateHolder.update { current ->
                     current.copy(
                         wifiConnected = fallbackWifi != null,
@@ -337,10 +357,24 @@ class DirectVpnService : VpnService() {
         }
 
         try {
-            cm.registerNetworkCallback(request, callback)
+            cm.requestNetwork(request, callback)
             wifiNetworkCallback = callback
+        } catch (e: SecurityException) {
+            Log.w(TAG, "requestNetwork denied by OEM security policy, falling back to registerNetworkCallback", e)
+            try {
+                cm.registerNetworkCallback(request, callback)
+                wifiNetworkCallback = callback
+            } catch (fallbackEx: Exception) {
+                Log.w(TAG, "Failed to register fallback Wi-Fi NetworkCallback", fallbackEx)
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to register Wi-Fi NetworkCallback", e)
+            Log.w(TAG, "requestNetwork failed, falling back to registerNetworkCallback", e)
+            try {
+                cm.registerNetworkCallback(request, callback)
+                wifiNetworkCallback = callback
+            } catch (fallbackEx: Exception) {
+                Log.w(TAG, "Failed to register fallback Wi-Fi NetworkCallback", fallbackEx)
+            }
         }
     }
 
@@ -539,10 +573,15 @@ class DirectVpnService : VpnService() {
         private const val NOTIFICATION_THROTTLE_MS = 2000L
 
         private const val DEFAULT_HOST_IP = "192.168.49.1"
-        private const val TUN_MTU = 8500
+        private const val TUN_MTU = 1500
         private const val TUN_IPV4_ADDRESS = "198.18.0.1"
-        private const val DNS_PRIMARY = "1.1.1.1"
-        private const val DNS_SECONDARY = "8.8.8.8"
+        private const val TUN_IPV6_ADDRESS = "fc00::1"
+        private const val MAPDNS_ADDRESS = "198.18.0.2"
+        private const val MAPDNS_PORT = 53
+        private const val MAPDNS_NETWORK = "100.64.0.0"
+        private const val MAPDNS_NETMASK = "255.192.0.0"
+        private const val MAPDNS_CACHE_SIZE = 10000
+        private const val WIFI_DISCOVERY_WAIT_MS = 1200L
         private const val HEV_CONFIG_FILENAME = "hev_tunnel.yml"
 
         const val ACTION_CONNECT = "com.directrouter.app.action.VPN_CONNECT"

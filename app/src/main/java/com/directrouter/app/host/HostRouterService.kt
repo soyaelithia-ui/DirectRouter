@@ -17,6 +17,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.directrouter.app.DirectRouterApp
+import com.directrouter.app.data.HostShareMode
 import com.directrouter.app.proxy.HybridProxyServer
 import com.directrouter.app.proxy.TrafficSnapshot
 import com.directrouter.app.proxy.TrafficStatsTracker
@@ -26,8 +27,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class HostRouterService : Service() {
 
@@ -35,6 +39,7 @@ class HostRouterService : Service() {
 
     private var startupJob: Job? = null
     private var statsJob: Job? = null
+    private var interfacePollJob: Job? = null
 
     private var statsTracker: TrafficStatsTracker? = null
     private var proxyServer: HybridProxyServer? = null
@@ -63,7 +68,7 @@ class HostRouterService : Service() {
                 startForegroundCompat(
                     buildNotification(
                         title = "DirectRouter Host",
-                        text = "Iniciando router Wi-Fi Direct...",
+                        text = "Iniciando servidor proxy...",
                     ),
                 )
                 startRouter()
@@ -100,14 +105,29 @@ class HostRouterService : Service() {
 
                 val app = application as DirectRouterApp
                 val settings = app.settingsRepository.getCurrentSettings()
+                val shareMode = settings.hostShareMode
 
                 HostStateHolder.update {
                     it.copy(
                         status = ServiceStatus.STARTING,
-                        ssid = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) settings.fullSsid else "",
-                        passphrase = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) settings.passphrase else "",
-                        ipAddress = WifiDirectInfo.DEFAULT_GROUP_OWNER_IP,
+                        shareMode = shareMode,
+                        ssid = if (shareMode == HostShareMode.WIFI_DIRECT && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            settings.fullSsid
+                        } else {
+                            ""
+                        },
+                        passphrase = if (shareMode == HostShareMode.WIFI_DIRECT && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            settings.passphrase
+                        } else {
+                            ""
+                        },
+                        ipAddress = if (shareMode == HostShareMode.NATIVE_TETHERING) {
+                            DEFAULT_TETHERING_IP
+                        } else {
+                            WifiDirectInfo.DEFAULT_GROUP_OWNER_IP
+                        },
                         port = settings.proxyPort,
+                        localIpAddresses = emptyList(),
                         errorMessage = null,
                     )
                 }
@@ -128,36 +148,100 @@ class HostRouterService : Service() {
 
                 startStatsCollection(tracker)
 
-                val wfdManager = WifiDirectManager(this@HostRouterService, serviceScope)
-                wifiDirectManager = wfdManager
+                if (shareMode == HostShareMode.NATIVE_TETHERING) {
+                    val detected = withContext(Dispatchers.IO) {
+                        NetworkInterfaceScanner.scanTetheringIps()
+                    }
+                    val primaryIp = detected.firstOrNull()?.ipAddress ?: DEFAULT_TETHERING_IP
+                    val formattedIps = detected.map { "${it.ipAddress} (${it.name})" }
 
-                val started = wfdManager.startGroup(
-                    settings = settings,
-                    onGroupUpdated = { info ->
-                        HostStateHolder.update { current ->
-                            current.copy(
-                                status = ServiceStatus.RUNNING,
-                                ssid = info.ssid,
-                                passphrase = info.passphrase,
-                                ipAddress = info.ipAddress,
-                                port = boundPort,
-                                connectedWifiClients = info.connectedClients,
-                                errorMessage = null,
-                            )
-                        }
-                        updateNotification(force = true)
-                    },
-                    onError = { errorMsg ->
-                        failAndStop(errorMsg)
-                    },
-                )
+                    HostStateHolder.update { current ->
+                        current.copy(
+                            status = ServiceStatus.RUNNING,
+                            shareMode = HostShareMode.NATIVE_TETHERING,
+                            ssid = "",
+                            passphrase = "",
+                            ipAddress = primaryIp,
+                            port = boundPort,
+                            connectedWifiClients = 0,
+                            localIpAddresses = formattedIps,
+                            errorMessage = null,
+                        )
+                    }
+                    updateNotification(force = true)
+                    startInterfacePolling(boundPort)
+                } else {
+                    val wfdManager = WifiDirectManager(this@HostRouterService, serviceScope)
+                    wifiDirectManager = wfdManager
 
-                if (!started && HostStateHolder.state.value.status != ServiceStatus.ERROR) {
-                    failAndStop("No se pudo iniciar el grupo Wi-Fi Direct.")
+                    val started = wfdManager.startGroup(
+                        settings = settings,
+                        onGroupUpdated = { info ->
+                            HostStateHolder.update { current ->
+                                current.copy(
+                                    status = ServiceStatus.RUNNING,
+                                    shareMode = HostShareMode.WIFI_DIRECT,
+                                    ssid = info.ssid,
+                                    passphrase = info.passphrase,
+                                    ipAddress = info.ipAddress,
+                                    port = boundPort,
+                                    connectedWifiClients = info.connectedClients,
+                                    errorMessage = null,
+                                )
+                            }
+                            updateNotification(force = true)
+                            serviceScope.launch {
+                                val detected = withContext(Dispatchers.IO) {
+                                    NetworkInterfaceScanner.scanTetheringIps()
+                                }
+                                val formattedIps = detected.map { "${it.ipAddress} (${it.name})" }
+                                HostStateHolder.update { current ->
+                                    if (current.status != ServiceStatus.RUNNING) return@update current
+                                    current.copy(localIpAddresses = formattedIps)
+                                }
+                            }
+                        },
+                        onError = { errorMsg ->
+                            failAndStop(errorMsg)
+                        },
+                    )
+
+                    if (!started && HostStateHolder.state.value.status != ServiceStatus.ERROR) {
+                        failAndStop("No se pudo iniciar el grupo Wi-Fi Direct.")
+                    }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error starting HostRouterService", e)
                 failAndStop(e.message ?: "Error al iniciar el servidor proxy o Wi-Fi Direct.")
+            }
+        }
+    }
+
+    private fun startInterfacePolling(boundPort: Int) {
+        interfacePollJob?.cancel()
+        interfacePollJob = serviceScope.launch {
+            while (isActive) {
+                delay(INTERFACE_POLL_INTERVAL_MS)
+                val state = HostStateHolder.state.value
+                if (state.status != ServiceStatus.RUNNING || state.shareMode != HostShareMode.NATIVE_TETHERING) {
+                    break
+                }
+                val detected = withContext(Dispatchers.IO) {
+                    NetworkInterfaceScanner.scanTetheringIps()
+                }
+                val primaryIp = detected.firstOrNull()?.ipAddress ?: DEFAULT_TETHERING_IP
+                val formattedIps = detected.map { "${it.ipAddress} (${it.name})" }
+                if (state.ipAddress != primaryIp || state.localIpAddresses != formattedIps) {
+                    HostStateHolder.update { current ->
+                        if (current.status != ServiceStatus.RUNNING) return@update current
+                        current.copy(
+                            ipAddress = primaryIp,
+                            port = boundPort,
+                            localIpAddresses = formattedIps,
+                        )
+                    }
+                    updateNotification(force = true)
+                }
             }
         }
     }
@@ -196,6 +280,8 @@ class HostRouterService : Service() {
         startupJob = null
         statsJob?.cancel()
         statsJob = null
+        interfacePollJob?.cancel()
+        interfacePollJob = null
 
         try {
             wifiDirectManager?.stopGroup()
@@ -338,10 +424,10 @@ class HostRouterService : Service() {
             return
         }
 
-        val title = if (state.ssid.isNotBlank()) {
-            "DirectRouter • ${state.ssid}"
-        } else {
-            "DirectRouter Host"
+        val title = when {
+            state.shareMode == HostShareMode.NATIVE_TETHERING -> "DirectRouter • Tethering Nativo"
+            state.ssid.isNotBlank() -> "DirectRouter • ${state.ssid}"
+            else -> "DirectRouter Host"
         }
         val speedLine = formatSpeedSummary(state.traffic)
         val text = "${state.ipAddress}:${state.port} • $speedLine"
@@ -408,6 +494,8 @@ class HostRouterService : Service() {
         private const val CHANNEL_ID = "directrouter_host"
         private const val NOTIFICATION_ID = 1001
         private const val NOTIFICATION_THROTTLE_MS = 2000L
+        private const val INTERFACE_POLL_INTERVAL_MS = 3000L
+        private const val DEFAULT_TETHERING_IP = "192.168.43.1"
 
         const val ACTION_START = "com.directrouter.app.action.HOST_START"
         const val ACTION_STOP = "com.directrouter.app.action.HOST_STOP"

@@ -2,12 +2,16 @@ package com.directrouter.app
 
 import android.app.Application
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.directrouter.app.client.ClientVpnState
 import com.directrouter.app.client.ClientVpnStateHolder
 import com.directrouter.app.client.DirectVpnService
+import com.directrouter.app.data.HostShareMode
 import com.directrouter.app.data.RouterSettings
 import com.directrouter.app.data.SettingsRepository
 import com.directrouter.app.data.ValidationUtils
@@ -35,6 +39,7 @@ sealed interface ConnectionProbeState {
 }
 
 class MainViewModel(
+    private val appContext: Context,
     private val settingsRepository: SettingsRepository,
 ) : ViewModel() {
 
@@ -99,8 +104,12 @@ class MainViewModel(
             val result = withContext(Dispatchers.IO) {
                 runCatching {
                     val startNs = System.nanoTime()
-                    Socket().use { socket ->
-                        socket.connect(InetSocketAddress(cleanIp, hostPort), PROBE_TIMEOUT_MS)
+                    val wifiNetwork = findActiveWifiNetwork()
+                    val socket = runCatching {
+                        wifiNetwork?.socketFactory?.createSocket()
+                    }.getOrNull() ?: Socket()
+                    socket.use { s ->
+                        s.connect(InetSocketAddress(cleanIp, hostPort), PROBE_TIMEOUT_MS)
                     }
                     ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
                 }
@@ -117,9 +126,31 @@ class MainViewModel(
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun findActiveWifiNetwork(): Network? {
+        val cm = appContext.getSystemService(ConnectivityManager::class.java) ?: return null
+        return runCatching {
+            cm.allNetworks.firstOrNull { network ->
+                val caps = cm.getNetworkCapabilities(network) ?: return@firstOrNull false
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                    !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            } ?: cm.activeNetwork?.takeIf { network ->
+                val caps = cm.getNetworkCapabilities(network) ?: return@takeIf false
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                    !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            }
+        }.getOrNull()
+    }
+
     fun clearProbeState() {
         probeJob?.cancel()
         _probeState.value = ConnectionProbeState.Idle
+    }
+
+    fun updateHostShareMode(mode: HostShareMode) {
+        viewModelScope.launch {
+            settingsRepository.updateHostShareMode(mode)
+        }
     }
 
     fun updateProxyPort(port: Int): Boolean {
@@ -172,7 +203,7 @@ class MainViewModel(
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
                     val app = application as DirectRouterApp
-                    return MainViewModel(app.settingsRepository) as T
+                    return MainViewModel(app.applicationContext, app.settingsRepository) as T
                 }
             }
         }

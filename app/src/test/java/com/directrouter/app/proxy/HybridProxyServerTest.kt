@@ -18,9 +18,12 @@ import java.io.InputStream
 import java.io.InputStreamReader
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -458,6 +461,367 @@ class HybridProxyServerTest {
         }
     }
 
+    @Test
+    fun pacEndpointServesValidAutoconfigScript() {
+        // 1. GET /proxy.pac with explicit Host header
+        Socket("127.0.0.1", proxyServer.boundPort).use { client ->
+            client.soTimeout = 5_000
+            val req = "GET /proxy.pac HTTP/1.1\r\nHost: 192.168.49.1:${proxyServer.boundPort}\r\n\r\n"
+            client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+            client.getOutputStream().flush()
+
+            val rawResponse = String(client.getInputStream().readBytes(), Charsets.UTF_8)
+            val splitIdx = rawResponse.indexOf("\r\n\r\n")
+            assertTrue("PAC response must have header/body separator", splitIdx > 0)
+
+            val headerPart = rawResponse.substring(0, splitIdx)
+            val bodyPart = rawResponse.substring(splitIdx + 4)
+
+            assertTrue("Expected 200 OK, got: $headerPart", headerPart.startsWith("HTTP/1.1 200 OK"))
+            assertTrue(
+                "Expected PAC Content-Type, got: $headerPart",
+                headerPart.contains("Content-Type: application/x-ns-proxy-autoconfig", ignoreCase = true),
+            )
+            assertTrue(
+                "Expected Cache-Control: no-cache",
+                headerPart.contains("Cache-Control: no-cache", ignoreCase = true),
+            )
+            assertTrue(
+                "Expected FindProxyForURL function",
+                bodyPart.contains("function FindProxyForURL(url, host)"),
+            )
+            assertTrue(
+                "Expected PROXY directive with Host IP and boundPort, got: $bodyPart",
+                bodyPart.contains("PROXY 192.168.49.1:${proxyServer.boundPort}; DIRECT"),
+            )
+        }
+
+        // 2. GET /wpad.dat without Host header falls back to local socket IPv4
+        Socket("127.0.0.1", proxyServer.boundPort).use { client ->
+            client.soTimeout = 5_000
+            val req = "GET /wpad.dat HTTP/1.1\r\n\r\n"
+            client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+            client.getOutputStream().flush()
+
+            val rawResponse = String(client.getInputStream().readBytes(), Charsets.UTF_8)
+            assertTrue(rawResponse.startsWith("HTTP/1.1 200 OK"))
+            assertTrue(rawResponse.contains("PROXY 127.0.0.1:${proxyServer.boundPort}; DIRECT"))
+        }
+
+        // 3. HEAD /proxy.pac returns headers with Content-Length and empty body
+        Socket("127.0.0.1", proxyServer.boundPort).use { client ->
+            client.soTimeout = 5_000
+            val req = "HEAD /proxy.pac HTTP/1.1\r\nHost: 127.0.0.1:${proxyServer.boundPort}\r\n\r\n"
+            client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+            client.getOutputStream().flush()
+
+            val rawResponse = String(client.getInputStream().readBytes(), Charsets.UTF_8)
+            val splitIdx = rawResponse.indexOf("\r\n\r\n")
+            assertTrue(splitIdx > 0)
+            val headerPart = rawResponse.substring(0, splitIdx)
+            val bodyPart = rawResponse.substring(splitIdx + 4)
+            assertTrue(headerPart.startsWith("HTTP/1.1 200 OK"))
+            assertTrue(headerPart.contains("Content-Length:", ignoreCase = true))
+            assertEquals("", bodyPart)
+        }
+    }
+
+    @Test
+    fun plainHttpWebSocketUpgradePreservesHeadersAndRelaysBidirectionalFrames() {
+        val capturedHeaders = AtomicReference<Map<String, String>>()
+        val originServer = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
+        val originThread = thread(isDaemon = true) {
+            try {
+                originServer.accept().use { socket ->
+                    socket.soTimeout = 5_000
+                    val input = socket.getInputStream()
+                    val output = socket.getOutputStream()
+                    val headerLines = readHttpHeadersRaw(input)
+                    val headers = mutableMapOf<String, String>()
+                    for (line in headerLines.drop(1)) {
+                        val idx = line.indexOf(':')
+                        if (idx > 0) {
+                            headers[line.substring(0, idx).trim().lowercase()] =
+                                line.substring(idx + 1).trim()
+                        }
+                    }
+                    capturedHeaders.set(headers)
+
+                    val switchingResp = buildString {
+                        append("HTTP/1.1 101 Switching Protocols\r\n")
+                        append("Upgrade: websocket\r\n")
+                        append("Connection: Upgrade\r\n")
+                        append("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+                    }
+                    output.write(switchingResp.toByteArray(Charsets.ISO_8859_1))
+                    output.flush()
+
+                    // Bidirectional frame relay after 101 upgrade
+                    val frame1 = readExactBytes(input, 10)
+                    output.write(("ACK1:" + String(frame1, Charsets.UTF_8)).toByteArray(Charsets.UTF_8))
+                    output.flush()
+
+                    val frame2 = readExactBytes(input, 10)
+                    output.write(("ACK2:" + String(frame2, Charsets.UTF_8)).toByteArray(Charsets.UTF_8))
+                    output.flush()
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        try {
+            Socket("127.0.0.1", proxyServer.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val out = client.getOutputStream()
+                val input = client.getInputStream()
+
+                val wsRequest = buildString {
+                    append("GET http://127.0.0.1:${originServer.localPort}/ws HTTP/1.1\r\n")
+                    append("Host: 127.0.0.1:${originServer.localPort}\r\n")
+                    append("Upgrade: websocket\r\n")
+                    append("Connection: keep-alive, Upgrade\r\n")
+                    append("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n")
+                    append("Sec-WebSocket-Version: 13\r\n\r\n")
+                }
+                out.write(wsRequest.toByteArray(Charsets.ISO_8859_1))
+                out.flush()
+
+                val responseHeaders = readHttpHeadersRaw(input)
+                assertTrue(
+                    "Expected 101 Switching Protocols, got: $responseHeaders",
+                    responseHeaders.firstOrNull()?.startsWith("HTTP/1.1 101") == true,
+                )
+
+                // Exchange full-duplex frames over upgraded socket
+                out.write("WS-FRAME-1".toByteArray(Charsets.UTF_8))
+                out.flush()
+                val reply1 = String(readExactBytes(input, 15), Charsets.UTF_8)
+                assertEquals("ACK1:WS-FRAME-1", reply1)
+
+                out.write("WS-FRAME-2".toByteArray(Charsets.UTF_8))
+                out.flush()
+                val reply2 = String(readExactBytes(input, 15), Charsets.UTF_8)
+                assertEquals("ACK2:WS-FRAME-2", reply2)
+            }
+
+            val headers = capturedHeaders.get()
+            assertEquals("websocket", headers["upgrade"]?.lowercase())
+            assertEquals("upgrade", headers["connection"]?.lowercase())
+            assertEquals("dGhlIHNhbXBsZSBub25jZQ==", headers["sec-websocket-key"])
+        } finally {
+            originServer.close()
+            originThread.join(1_000)
+        }
+    }
+
+    @Test
+    fun socks4AndSocks4aConnectTunnelIpv4AndDomainTargets() {
+        val echoServer = startTcpEchoServer()
+        try {
+            // 1. SOCKS4 (IPv4 127.0.0.1)
+            Socket("127.0.0.1", proxyServer.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val input = client.getInputStream()
+                val out = client.getOutputStream()
+
+                val socks4Req = ByteArrayOutputStream().apply {
+                    write(0x04) // VN = 4
+                    write(0x01) // CD = CONNECT
+                    write((echoServer.port ushr 8) and 0xFF)
+                    write(echoServer.port and 0xFF)
+                    write(byteArrayOf(127, 0, 0, 1))
+                    write("testuser".toByteArray(Charsets.UTF_8))
+                    write(0x00) // null terminator for USERID
+                }.toByteArray()
+                out.write(socks4Req)
+                out.flush()
+
+                val reply = readExactBytes(input, 8)
+                assertEquals(0x00, reply[0].toInt() and 0xFF)
+                assertEquals(0x5A, reply[1].toInt() and 0xFF)
+
+                val payload = "socks4-ipv4-echo-payload"
+                out.write(payload.toByteArray(Charsets.UTF_8))
+                out.flush()
+                client.shutdownOutput()
+
+                val echoed = String(input.readBytes(), Charsets.UTF_8)
+                assertEquals(payload, echoed)
+            }
+
+            // 2. SOCKS4a (domain "localhost" via 0.0.0.1)
+            Socket("127.0.0.1", proxyServer.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val input = client.getInputStream()
+                val out = client.getOutputStream()
+
+                val socks4aReq = ByteArrayOutputStream().apply {
+                    write(0x04) // VN = 4
+                    write(0x01) // CD = CONNECT
+                    write((echoServer.port ushr 8) and 0xFF)
+                    write(echoServer.port and 0xFF)
+                    write(byteArrayOf(0, 0, 0, 1)) // SOCKS4a marker
+                    write(0x00) // empty USERID
+                    write("localhost".toByteArray(Charsets.UTF_8))
+                    write(0x00) // null terminator for DOMAIN
+                }.toByteArray()
+                out.write(socks4aReq)
+                out.flush()
+
+                val reply = readExactBytes(input, 8)
+                assertEquals(0x00, reply[0].toInt() and 0xFF)
+                assertEquals(0x5A, reply[1].toInt() and 0xFF)
+
+                val payload = "socks4a-domain-localhost-echo-payload"
+                out.write(payload.toByteArray(Charsets.UTF_8))
+                out.flush()
+                client.shutdownOutput()
+
+                val echoed = String(input.readBytes(), Charsets.UTF_8)
+                assertEquals(payload, echoed)
+            }
+
+            // 3. SOCKS4 unsupported command (BIND = 0x02) -> rejected with 0x5B
+            Socket("127.0.0.1", proxyServer.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val input = client.getInputStream()
+                val out = client.getOutputStream()
+
+                val bindReq = byteArrayOf(
+                    0x04, 0x02,
+                    ((echoServer.port ushr 8) and 0xFF).toByte(),
+                    (echoServer.port and 0xFF).toByte(),
+                    127, 0, 0, 1,
+                    0x00,
+                )
+                out.write(bindReq)
+                out.flush()
+
+                val reply = readExactBytes(input, 8)
+                assertEquals(0x00, reply[0].toInt() and 0xFF)
+                assertEquals(0x5B, reply[1].toInt() and 0xFF)
+            }
+        } finally {
+            echoServer.close()
+        }
+    }
+
+    @Test
+    fun socks5NormalizeLocalBindAddressUnwrapsIpv4MappedIpv6AndWildcards() {
+        val mappedBytes = byteArrayOf(
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0xFF.toByte(), 0xFF.toByte(),
+            192.toByte(), 168.toByte(), 49, 1,
+        )
+        val ipv4MappedV6 = Inet6Address.getByAddress(null, mappedBytes, -1)
+        val normalizedMapped = Socks5Handler.normalizeLocalBindAddress(ipv4MappedV6)
+        assertTrue("Expected Inet4Address", normalizedMapped is Inet4Address)
+        assertEquals(4, normalizedMapped.address.size)
+        assertEquals("192.168.49.1", normalizedMapped.hostAddress)
+
+        val wildcardV4 = InetAddress.getByAddress(byteArrayOf(0, 0, 0, 0))
+        val normalizedWildcard = Socks5Handler.normalizeLocalBindAddress(wildcardV4)
+        assertTrue("Wildcard must resolve to clean IPv4", normalizedWildcard is Inet4Address)
+        assertEquals("127.0.0.1", normalizedWildcard.hostAddress)
+
+        val loopbackV6 = InetAddress.getByName("::1")
+        val normalizedLoopbackV6 = Socks5Handler.normalizeLocalBindAddress(loopbackV6)
+        assertTrue("IPv6 loopback must normalize to IPv4 loopback", normalizedLoopbackV6 is Inet4Address)
+        assertEquals("127.0.0.1", normalizedLoopbackV6.hostAddress)
+    }
+
+    @Test
+    fun highConcurrencyStressTestHandles80SimultaneousTcpConnections() {
+        val concurrency = 80
+        val echoServer = startTcpEchoServer(backlog = 256)
+        val allEstablished = CountDownLatch(concurrency)
+        val releaseBarrier = CountDownLatch(1)
+        val allCompleted = CountDownLatch(concurrency)
+        val errors = CopyOnWriteArrayList<Throwable>()
+
+        val workers = (0 until concurrency).map { index ->
+            thread(isDaemon = true, name = "stress-client-$index") {
+                try {
+                    Socket("127.0.0.1", proxyServer.boundPort).use { client ->
+                        client.soTimeout = 15_000
+                        val out = client.getOutputStream()
+                        val input = client.getInputStream()
+
+                        if (index % 2 == 0) {
+                            // HTTP CONNECT tunnel
+                            val req =
+                                "CONNECT 127.0.0.1:${echoServer.port} HTTP/1.1\r\nHost: 127.0.0.1:${echoServer.port}\r\n\r\n"
+                            out.write(req.toByteArray(Charsets.ISO_8859_1))
+                            out.flush()
+                            val statusLines = readHttpHeadersRaw(input)
+                            assertTrue(
+                                "Client $index expected 200 OK, got $statusLines",
+                                statusLines.firstOrNull()?.startsWith("HTTP/1.1 200") == true,
+                            )
+                        } else {
+                            // SOCKS5 CONNECT tunnel
+                            out.write(byteArrayOf(0x05, 0x01, 0x00))
+                            out.flush()
+                            val authReply = readExactBytes(input, 2)
+                            assertEquals(0x00, authReply[1].toInt() and 0xFF)
+                            val connectReq = byteArrayOf(
+                                0x05, 0x01, 0x00, 0x01,
+                                127, 0, 0, 1,
+                                ((echoServer.port ushr 8) and 0xFF).toByte(),
+                                (echoServer.port and 0xFF).toByte(),
+                            )
+                            out.write(connectReq)
+                            out.flush()
+                            val reply = readSocks5Reply(input)
+                            assertEquals(0x00, reply.rep)
+                        }
+
+                        // Hold all 80 tunnels open simultaneously (160+ active proxy relay threads!)
+                        allEstablished.countDown()
+                        assertTrue(
+                            "Timed out waiting for all $concurrency tunnels to establish",
+                            releaseBarrier.await(15, TimeUnit.SECONDS),
+                        )
+
+                        val payload = "stress-payload-connection-$index-0123456789"
+                        out.write(payload.toByteArray(Charsets.UTF_8))
+                        out.flush()
+                        client.shutdownOutput()
+
+                        val echoed = String(input.readBytes(), Charsets.UTF_8)
+                        assertEquals("Client $index echo mismatch", payload, echoed)
+                    }
+                } catch (t: Throwable) {
+                    errors.add(t)
+                    allEstablished.countDown()
+                } finally {
+                    allCompleted.countDown()
+                }
+            }
+        }
+
+        try {
+            assertTrue(
+                "All $concurrency simultaneous connections must establish without thread starvation (remaining=${allEstablished.count}, errors=${errors.take(3)})",
+                allEstablished.await(15, TimeUnit.SECONDS),
+            )
+            releaseBarrier.countDown()
+            assertTrue(
+                "All $concurrency connections must complete cleanly (remaining=${allCompleted.count})",
+                allCompleted.await(15, TimeUnit.SECONDS),
+            )
+            assertTrue("Expected zero errors across $concurrency connections, got: $errors", errors.isEmpty())
+
+            waitForActiveConnectionsZero()
+            assertEquals(0, statsTracker.snapshot.value.activeConnections)
+            assertTrue(statsTracker.snapshot.value.totalConnections >= concurrency.toLong())
+        } finally {
+            releaseBarrier.countDown()
+            workers.forEach { it.join(2_000) }
+            echoServer.close()
+        }
+    }
+
     private class TcpEchoServer(
         private val serverSocket: ServerSocket,
         private val acceptThread: Thread,
@@ -470,8 +834,8 @@ class HybridProxyServerTest {
         }
     }
 
-    private fun startTcpEchoServer(): TcpEchoServer {
-        val server = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
+    private fun startTcpEchoServer(backlog: Int = 64): TcpEchoServer {
+        val server = ServerSocket(0, backlog, InetAddress.getByName("127.0.0.1"))
         val acceptThread = thread(isDaemon = true) {
             while (!server.isClosed) {
                 val client = try {
