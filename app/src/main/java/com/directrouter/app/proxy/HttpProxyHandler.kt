@@ -9,9 +9,11 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.InetAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.net.URI
+import java.util.Base64
 
 internal object HttpProxyHandler {
     private const val MAX_HEADER_BYTES = 64 * 1024
@@ -35,6 +37,12 @@ internal object HttpProxyHandler {
         "HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII)
     private val RESPONSE_400_BAD_REQUEST =
         "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            .toByteArray(Charsets.US_ASCII)
+    private val RESPONSE_403_FORBIDDEN =
+        "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            .toByteArray(Charsets.US_ASCII)
+    private val RESPONSE_407_PROXY_AUTH_REQUIRED =
+        "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"DirectRouter\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             .toByteArray(Charsets.US_ASCII)
     private val RESPONSE_502_BAD_GATEWAY =
         "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
@@ -65,6 +73,9 @@ internal object HttpProxyHandler {
         statsTracker: TrafficStatsTracker,
         @Suppress("UNUSED_PARAMETER") scope: CoroutineScope,
         dispatcher: CoroutineDispatcher,
+        securityPolicy: ProxySecurityPolicy = ProxySecurityPolicy(),
+        proxyBoundPort: Int = clientSocket.localPort,
+        localAddresses: Set<InetAddress> = emptySet(),
     ) {
         val request = try {
             readHttpRequest(clientIn)
@@ -75,16 +86,69 @@ internal object HttpProxyHandler {
             return
         } ?: return
 
+        // PAC endpoints are local autoconfig fetches made by Android Wi-Fi settings without Proxy-Authorization.
         if (isPacRequest(request)) {
-            handlePacRequest(request, clientSocket, clientOut, statsTracker)
+            handlePacRequest(request, clientSocket, clientOut, statsTracker, proxyBoundPort)
+            return
+        }
+
+        if (securityPolicy.authEnabled && !isProxyAuthorized(request, securityPolicy)) {
+            writeResponseQuietly(clientOut, RESPONSE_407_PROXY_AUTH_REQUIRED)
             return
         }
 
         if (request.method.equals("CONNECT", ignoreCase = true)) {
-            handleConnect(request, clientSocket, clientIn, clientOut, statsTracker, dispatcher)
+            handleConnect(
+                request = request,
+                clientSocket = clientSocket,
+                clientIn = clientIn,
+                clientOut = clientOut,
+                statsTracker = statsTracker,
+                dispatcher = dispatcher,
+                securityPolicy = securityPolicy,
+                proxyBoundPort = proxyBoundPort,
+                localAddresses = localAddresses,
+            )
         } else {
-            handlePlainHttp(request, clientSocket, clientIn, clientOut, statsTracker, dispatcher)
+            handlePlainHttp(
+                request = request,
+                clientSocket = clientSocket,
+                clientIn = clientIn,
+                clientOut = clientOut,
+                statsTracker = statsTracker,
+                dispatcher = dispatcher,
+                securityPolicy = securityPolicy,
+                proxyBoundPort = proxyBoundPort,
+                localAddresses = localAddresses,
+            )
         }
+    }
+
+    private fun isProxyAuthorized(
+        request: ParsedHttpRequest,
+        securityPolicy: ProxySecurityPolicy,
+    ): Boolean {
+        val authHeader = request.headers
+            .firstOrNull { it.first.equals("Proxy-Authorization", ignoreCase = true) }
+            ?.second
+            ?: return false
+
+        val spaceIdx = authHeader.indexOf(' ')
+        if (spaceIdx <= 0) return false
+        val scheme = authHeader.substring(0, spaceIdx)
+        if (!scheme.equals("Basic", ignoreCase = true)) return false
+
+        val encoded = authHeader.substring(spaceIdx + 1).trim()
+        if (encoded.isEmpty()) return false
+
+        val decodedBytes = runCatching { Base64.getDecoder().decode(encoded) }.getOrNull() ?: return false
+        val decoded = String(decodedBytes, Charsets.UTF_8)
+        val colonIdx = decoded.indexOf(':')
+        if (colonIdx < 0) return false
+
+        val username = decoded.substring(0, colonIdx)
+        val password = decoded.substring(colonIdx + 1)
+        return securityPolicy.verifyCredentials(username, password)
     }
 
     private fun isPacRequest(request: ParsedHttpRequest): Boolean {
@@ -100,22 +164,25 @@ internal object HttpProxyHandler {
         clientSocket: Socket,
         clientOut: OutputStream,
         statsTracker: TrafficStatsTracker,
+        proxyBoundPort: Int,
     ) {
         val hostHeader = request.headers
             .firstOrNull { it.first.equals("Host", ignoreCase = true) }
             ?.second
-        val parsedHost = hostHeader?.let { parseAuthority(it, clientSocket.localPort)?.host }
-        val proxyHost = if (!parsedHost.isNullOrBlank()) {
-            stripIpv4MappedPrefix(parsedHost)
+        val sanitizedHostHeader = hostHeader?.let { ProxySecurityPolicy.sanitizePacHost(it) }
+        val proxyPort = if (proxyBoundPort in 1..65535) proxyBoundPort else clientSocket.localPort
+
+        val formattedHost = if (sanitizedHostHeader != null) {
+            extractSanitizedHostOnly(sanitizedHostHeader)
         } else {
-            Socks5Handler.normalizeLocalBindAddress(clientSocket.localAddress).hostAddress ?: "127.0.0.1"
+            val fallbackHost = Socks5Handler.normalizeLocalBindAddress(clientSocket.localAddress)
+                .hostAddress ?: "127.0.0.1"
+            if (fallbackHost.contains(':') && !fallbackHost.startsWith('[')) {
+                "[$fallbackHost]"
+            } else {
+                fallbackHost
+            }
         }
-        val formattedHost = if (proxyHost.contains(':') && !proxyHost.startsWith('[')) {
-            "[$proxyHost]"
-        } else {
-            proxyHost
-        }
-        val proxyPort = clientSocket.localPort
 
         val pacBody = buildString {
             append("function FindProxyForURL(url, host) {\n")
@@ -149,6 +216,22 @@ internal object HttpProxyHandler {
         }
     }
 
+    private fun extractSanitizedHostOnly(sanitizedHostHeader: String): String {
+        if (sanitizedHostHeader.startsWith('[')) {
+            val closeIdx = sanitizedHostHeader.indexOf(']')
+            val inner = sanitizedHostHeader.substring(1, closeIdx)
+            val stripped = stripIpv4MappedPrefix(inner)
+            return if (stripped.contains(':')) "[$stripped]" else stripped
+        }
+        val hostOnly = if (sanitizedHostHeader.count { it == ':' } == 1) {
+            sanitizedHostHeader.substringBefore(':')
+        } else {
+            sanitizedHostHeader
+        }
+        val stripped = stripIpv4MappedPrefix(hostOnly)
+        return if (stripped.contains(':')) "[$stripped]" else stripped
+    }
+
     private fun stripIpv4MappedPrefix(host: String): String {
         val lower = host.lowercase()
         return if (lower.startsWith("::ffff:")) {
@@ -165,6 +248,9 @@ internal object HttpProxyHandler {
         clientOut: OutputStream,
         statsTracker: TrafficStatsTracker,
         dispatcher: CoroutineDispatcher,
+        securityPolicy: ProxySecurityPolicy,
+        proxyBoundPort: Int,
+        localAddresses: Set<InetAddress>,
     ) {
         val hostPort = parseAuthority(request.target, DEFAULT_HTTPS_PORT)
         if (hostPort == null) {
@@ -172,10 +258,24 @@ internal object HttpProxyHandler {
             return
         }
 
-        val remoteSocket = OutboundConnector.connect(hostPort.host, hostPort.port)
-        if (remoteSocket == null) {
-            writeResponseQuietly(clientOut, RESPONSE_502_BAD_GATEWAY)
-            return
+        val remoteSocket = when (
+            val result = OutboundConnector.connectWithResult(
+                host = hostPort.host,
+                port = hostPort.port,
+                securityPolicy = securityPolicy,
+                proxyBoundPort = proxyBoundPort,
+                localAddresses = localAddresses,
+            )
+        ) {
+            is OutboundConnector.ConnectResult.Success -> result.socket
+            is OutboundConnector.ConnectResult.Blocked -> {
+                writeResponseQuietly(clientOut, RESPONSE_403_FORBIDDEN)
+                return
+            }
+            is OutboundConnector.ConnectResult.Failure -> {
+                writeResponseQuietly(clientOut, RESPONSE_502_BAD_GATEWAY)
+                return
+            }
         }
 
         try {
@@ -204,6 +304,9 @@ internal object HttpProxyHandler {
         clientOut: OutputStream,
         statsTracker: TrafficStatsTracker,
         dispatcher: CoroutineDispatcher,
+        securityPolicy: ProxySecurityPolicy,
+        proxyBoundPort: Int,
+        localAddresses: Set<InetAddress>,
     ) {
         val target = resolveHttpTarget(request.target, request.headers)
         if (target == null) {
@@ -211,10 +314,24 @@ internal object HttpProxyHandler {
             return
         }
 
-        val remoteSocket = OutboundConnector.connect(target.host, target.port)
-        if (remoteSocket == null) {
-            writeResponseQuietly(clientOut, RESPONSE_502_BAD_GATEWAY)
-            return
+        val remoteSocket = when (
+            val result = OutboundConnector.connectWithResult(
+                host = target.host,
+                port = target.port,
+                securityPolicy = securityPolicy,
+                proxyBoundPort = proxyBoundPort,
+                localAddresses = localAddresses,
+            )
+        ) {
+            is OutboundConnector.ConnectResult.Success -> result.socket
+            is OutboundConnector.ConnectResult.Blocked -> {
+                writeResponseQuietly(clientOut, RESPONSE_403_FORBIDDEN)
+                return
+            }
+            is OutboundConnector.ConnectResult.Failure -> {
+                writeResponseQuietly(clientOut, RESPONSE_502_BAD_GATEWAY)
+                return
+            }
         }
 
         try {

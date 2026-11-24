@@ -19,6 +19,10 @@ internal object Socks4Handler {
     private const val REP_REJECTED = 0x5B
     private const val MAX_NULL_TERMINATED_BYTES = 256
 
+    fun rejectImmediately(clientOut: OutputStream) {
+        sendReply(clientOut, REP_REJECTED, null, 0)
+    }
+
     suspend fun handle(
         clientSocket: Socket,
         clientIn: InputStream,
@@ -26,7 +30,15 @@ internal object Socks4Handler {
         statsTracker: TrafficStatsTracker,
         @Suppress("UNUSED_PARAMETER") scope: CoroutineScope,
         dispatcher: CoroutineDispatcher,
+        securityPolicy: ProxySecurityPolicy = ProxySecurityPolicy(),
+        proxyBoundPort: Int = clientSocket.localPort,
+        localAddresses: Set<InetAddress> = emptySet(),
     ) {
+        if (securityPolicy.authEnabled) {
+            rejectImmediately(clientOut)
+            return
+        }
+
         val header = readExact(clientIn, 8) ?: return
         val version = header[0].toInt() and 0xFF
         val command = header[1].toInt() and 0xFF
@@ -60,15 +72,29 @@ internal object Socks4Handler {
         }
 
         val connectResult = if (isSocks4a) {
-            OutboundConnector.connectWithResult(domain!!, dstPort)
+            OutboundConnector.connectWithResult(
+                host = domain!!,
+                port = dstPort,
+                securityPolicy = securityPolicy,
+                proxyBoundPort = proxyBoundPort,
+                localAddresses = localAddresses,
+            )
         } else {
             val targetIp = InetAddress.getByAddress(dstIpBytes)
-            OutboundConnector.connectWithResult(targetIp, dstPort)
+            OutboundConnector.connectWithResult(
+                address = targetIp,
+                port = dstPort,
+                securityPolicy = securityPolicy,
+                proxyBoundPort = proxyBoundPort,
+                localAddresses = localAddresses,
+            )
         }
 
         val remoteSocket = when (connectResult) {
             is OutboundConnector.ConnectResult.Success -> connectResult.socket
-            is OutboundConnector.ConnectResult.Failure -> {
+            is OutboundConnector.ConnectResult.Blocked,
+            is OutboundConnector.ConnectResult.Failure,
+            -> {
                 sendReply(clientOut, REP_REJECTED, null, 0)
                 return
             }
