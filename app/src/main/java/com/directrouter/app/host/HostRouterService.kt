@@ -71,7 +71,7 @@ class HostRouterService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannels()
+        ensureNotificationChannels(this)
         startSettingsObservation()
     }
 
@@ -861,77 +861,6 @@ class HostRouterService : Service() {
         }
     }
 
-    private fun createNotificationChannels() {
-        val manager = getSystemService(NotificationManager::class.java) ?: return
-        val defaultSoundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-        val audioAttributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-            .build()
-        val alertVibrationPattern = longArrayOf(0L, 180L, 100L, 180L)
-
-        val serviceChannel = NotificationChannel(
-            CHANNEL_ID_SERVICE,
-            "DirectRouter Host",
-            NotificationManager.IMPORTANCE_LOW,
-        ).apply {
-            description = "Estado del router Wi-Fi Direct y proxy local"
-            setShowBadge(false)
-        }
-
-        val alertsSoundVibrate = NotificationChannel(
-            CHANNEL_ID_ALERTS_SOUND_VIBRATE,
-            "Alertas (Sonido y vibración)",
-            NotificationManager.IMPORTANCE_HIGH,
-        ).apply {
-            description = "Alertas de clientes conectados/desconectados y errores con sonido y vibración"
-            setSound(defaultSoundUri, audioAttributes)
-            enableVibration(true)
-            vibrationPattern = alertVibrationPattern
-        }
-
-        val alertsSound = NotificationChannel(
-            CHANNEL_ID_ALERTS_SOUND,
-            "Alertas (Solo sonido)",
-            NotificationManager.IMPORTANCE_DEFAULT,
-        ).apply {
-            description = "Alertas de clientes y errores con sonido"
-            setSound(defaultSoundUri, audioAttributes)
-            enableVibration(false)
-        }
-
-        val alertsVibrate = NotificationChannel(
-            CHANNEL_ID_ALERTS_VIBRATE,
-            "Alertas (Solo vibración)",
-            NotificationManager.IMPORTANCE_DEFAULT,
-        ).apply {
-            description = "Alertas de clientes y errores con vibración"
-            setSound(null, null)
-            enableVibration(true)
-            vibrationPattern = alertVibrationPattern
-        }
-
-        val alertsSilent = NotificationChannel(
-            CHANNEL_ID_ALERTS_SILENT,
-            "Alertas (Silencioso)",
-            NotificationManager.IMPORTANCE_LOW,
-        ).apply {
-            description = "Alertas silenciosas de clientes y errores"
-            setSound(null, null)
-            enableVibration(false)
-        }
-
-        manager.createNotificationChannels(
-            listOf(
-                serviceChannel,
-                alertsSoundVibrate,
-                alertsSound,
-                alertsVibrate,
-                alertsSilent,
-            ),
-        )
-    }
-
     private fun startForegroundCompat(notification: Notification) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             try {
@@ -1212,6 +1141,77 @@ class HostRouterService : Service() {
         const val ACTION_START = "com.directrouter.app.action.HOST_START"
         const val ACTION_STOP = "com.directrouter.app.action.HOST_STOP"
         const val ACTION_RESTART = "com.directrouter.app.action.RESTART_HOST"
+
+        fun ensureNotificationChannels(context: Context) {
+            val manager = context.getSystemService(NotificationManager::class.java) ?: return
+            val defaultSoundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            val audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            val alertVibrationPattern = longArrayOf(0L, 180L, 100L, 180L)
+
+            val serviceChannel = NotificationChannel(
+                CHANNEL_ID_SERVICE,
+                "DirectRouter Host",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = "Estado del router Wi-Fi Direct y proxy local"
+                setShowBadge(false)
+            }
+
+            val alertsSoundVibrate = NotificationChannel(
+                CHANNEL_ID_ALERTS_SOUND_VIBRATE,
+                "Alertas (Sonido y vibración)",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Alertas de clientes conectados/desconectados y errores con sonido y vibración"
+                setSound(defaultSoundUri, audioAttributes)
+                enableVibration(true)
+                vibrationPattern = alertVibrationPattern
+            }
+
+            val alertsSound = NotificationChannel(
+                CHANNEL_ID_ALERTS_SOUND,
+                "Alertas (Solo sonido)",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Alertas de clientes y errores con sonido"
+                setSound(defaultSoundUri, audioAttributes)
+                enableVibration(false)
+            }
+
+            val alertsVibrate = NotificationChannel(
+                CHANNEL_ID_ALERTS_VIBRATE,
+                "Alertas (Solo vibración)",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "Alertas de clientes y errores con vibración"
+                setSound(null, null)
+                enableVibration(true)
+                vibrationPattern = alertVibrationPattern
+            }
+
+            val alertsSilent = NotificationChannel(
+                CHANNEL_ID_ALERTS_SILENT,
+                "Alertas (Silencioso)",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = "Alertas silenciosas de clientes y errores"
+                setSound(null, null)
+                enableVibration(false)
+            }
+
+            manager.createNotificationChannels(
+                listOf(
+                    serviceChannel,
+                    alertsSoundVibrate,
+                    alertsSound,
+                    alertsVibrate,
+                    alertsSilent,
+                ),
+            )
+        }
 
         fun resolveAlertChannelId(sound: Boolean, vibrate: Boolean): String = when {
             sound && vibrate -> CHANNEL_ID_ALERTS_SOUND_VIBRATE
