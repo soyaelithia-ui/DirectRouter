@@ -9,11 +9,13 @@ import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.net.DatagramPacket
@@ -23,9 +25,12 @@ import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
+import java.util.Base64
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
@@ -39,7 +44,12 @@ class HybridProxyServerTest {
         statsTracker = TrafficStatsTracker()
         proxyServer = HybridProxyServer(statsTracker)
         runBlocking {
-            proxyServer.start(port = 0, bindAddress = "127.0.0.1")
+            // Existing loopback relay tests intentionally connect to local test servers on 127.0.0.1.
+            proxyServer.start(
+                port = 0,
+                bindAddress = "127.0.0.1",
+                securityPolicy = ProxySecurityPolicy(blockLoopbackAndSelf = false),
+            )
         }
         assertTrue("Proxy server should be running", proxyServer.isRunning)
         assertTrue("Proxy server should bind ephemeral port", proxyServer.boundPort > 0)
@@ -819,6 +829,629 @@ class HybridProxyServerTest {
             releaseBarrier.countDown()
             workers.forEach { it.join(2_000) }
             echoServer.close()
+        }
+    }
+
+    @Test
+    fun proxySecurityPolicyUnitChecksCoverSsrfCredentialsAndPacSanitization() {
+        val defaultPolicy = ProxySecurityPolicy()
+        assertTrue(defaultPolicy.blockLoopbackAndSelf)
+        assertEquals(256, defaultPolicy.maxConcurrentConnections)
+        assertFalse(defaultPolicy.authEnabled)
+
+        val hostIp = InetAddress.getByName("192.168.49.1")
+        val localAddresses = setOf(hostIp)
+
+        // Blocked ranges: loopback, wildcard, link-local, IPv4-mapped IPv6, and self proxy port
+        assertTrue(defaultPolicy.isTargetBlocked(InetAddress.getByName("127.0.0.1"), 80, 8080, localAddresses))
+        assertTrue(defaultPolicy.isTargetBlocked(InetAddress.getByName("127.255.0.1"), 443, 8080, localAddresses))
+        assertTrue(defaultPolicy.isTargetBlocked(InetAddress.getByName("::1"), 443, 8080, localAddresses))
+        assertTrue(defaultPolicy.isTargetBlocked(InetAddress.getByName("0.0.0.0"), 80, 8080, localAddresses))
+        assertTrue(defaultPolicy.isTargetBlocked(InetAddress.getByName("::"), 80, 8080, localAddresses))
+        assertTrue(defaultPolicy.isTargetBlocked(InetAddress.getByName("169.254.169.254"), 80, 8080, localAddresses))
+        assertTrue(defaultPolicy.isTargetBlocked(InetAddress.getByName("fe80::1"), 80, 8080, localAddresses))
+
+        val mappedLoopback = Inet6Address.getByAddress(
+            null,
+            byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF.toByte(), 0xFF.toByte(), 127, 0, 0, 1),
+            -1,
+        )
+        val mappedLinkLocal = Inet6Address.getByAddress(
+            null,
+            byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF.toByte(), 0xFF.toByte(), 169.toByte(), 254.toByte(), 1, 1),
+            -1,
+        )
+        val mappedWildcard = Inet6Address.getByAddress(
+            null,
+            byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF.toByte(), 0xFF.toByte(), 0, 0, 0, 0),
+            -1,
+        )
+        val mappedHost = Inet6Address.getByAddress(
+            null,
+            byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF.toByte(), 0xFF.toByte(), 192.toByte(), 168.toByte(), 49, 1),
+            -1,
+        )
+        assertTrue(defaultPolicy.isTargetBlocked(mappedLoopback, 443, 8080, localAddresses))
+        assertTrue(defaultPolicy.isTargetBlocked(mappedLinkLocal, 80, 8080, localAddresses))
+        assertTrue(defaultPolicy.isTargetBlocked(mappedWildcard, 80, 8080, localAddresses))
+
+        // Self-proxy loop check (same local IP + proxyBoundPort)
+        assertTrue(defaultPolicy.isTargetBlocked(hostIp, 8080, 8080, localAddresses))
+        assertTrue(defaultPolicy.isTargetBlocked(mappedHost, 8080, 8080, localAddresses))
+        assertFalse(defaultPolicy.isTargetBlocked(hostIp, 9000, 8080, localAddresses))
+
+        // Public address is allowed
+        assertFalse(defaultPolicy.isTargetBlocked(InetAddress.getByName("8.8.8.8"), 53, 8080, localAddresses))
+        assertFalse(defaultPolicy.isTargetBlocked(InetAddress.getByName("8.8.8.8"), 8080, 8080, localAddresses))
+
+        // Disabled anti-SSRF allows loopback and self
+        val permissivePolicy = ProxySecurityPolicy(blockLoopbackAndSelf = false)
+        assertFalse(permissivePolicy.isTargetBlocked(InetAddress.getByName("127.0.0.1"), 8080, 8080, localAddresses))
+        assertFalse(permissivePolicy.isTargetBlocked(hostIp, 8080, 8080, localAddresses))
+
+        // Constant-time credential verification
+        val authPolicy = ProxySecurityPolicy(
+            authEnabled = true,
+            authUsername = "router",
+            authPassword = "p@ss:word-UTF8-\u00f1",
+        )
+        assertTrue(authPolicy.verifyCredentials("router", "p@ss:word-UTF8-\u00f1"))
+        assertFalse(authPolicy.verifyCredentials("router", "wrong"))
+        assertFalse(authPolicy.verifyCredentials("wrong", "p@ss:word-UTF8-\u00f1"))
+        assertFalse(authPolicy.verifyCredentials("", ""))
+
+        // PAC Host sanitization
+        assertEquals("192.168.49.1", ProxySecurityPolicy.sanitizePacHost("192.168.49.1"))
+        assertEquals("192.168.49.1:8080", ProxySecurityPolicy.sanitizePacHost("192.168.49.1:8080"))
+        assertEquals("[2001:db8::1]:8080", ProxySecurityPolicy.sanitizePacHost("[2001:db8::1]:8080"))
+        assertEquals("[::1]", ProxySecurityPolicy.sanitizePacHost("[::1]"))
+        assertEquals("[2001:db8::1]", ProxySecurityPolicy.sanitizePacHost("2001:db8::1"))
+        assertNull(ProxySecurityPolicy.sanitizePacHost("192.168.49.1\"; alert(1);//"))
+        assertNull(ProxySecurityPolicy.sanitizePacHost("192.168.49.1:8080; DIRECT"))
+        assertNull(ProxySecurityPolicy.sanitizePacHost("192.168.49.1 "))
+        assertNull(ProxySecurityPolicy.sanitizePacHost("192.168.49.1:0"))
+        assertNull(ProxySecurityPolicy.sanitizePacHost("192.168.49.1:65536"))
+        assertNull(ProxySecurityPolicy.sanitizePacHost("192.168.01.1"))
+        assertNull(ProxySecurityPolicy.sanitizePacHost("evil.example.com:8080"))
+        assertNull(ProxySecurityPolicy.sanitizePacHost(""))
+    }
+
+    @Test
+    fun antiSsrfBlocksLoopbackAcrossHttpSocks5Socks4AndUdpWhenEnabled() {
+        val strictStats = TrafficStatsTracker()
+        val strictProxy = HybridProxyServer(strictStats)
+        val echoServer = startTcpEchoServer()
+        val udpEchoSocket = DatagramSocket(0, InetAddress.getByName("127.0.0.1"))
+        val udpReceivedCount = AtomicInteger(0)
+        val udpThread = thread(isDaemon = true) {
+            val buf = ByteArray(1024)
+            while (!udpEchoSocket.isClosed) {
+                try {
+                    val pkt = DatagramPacket(buf, buf.size)
+                    udpEchoSocket.receive(pkt)
+                    udpReceivedCount.incrementAndGet()
+                    udpEchoSocket.send(DatagramPacket(pkt.data, pkt.length, pkt.address, pkt.port))
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }
+
+        try {
+            runBlocking {
+                strictProxy.start(
+                    port = 0,
+                    bindAddress = "127.0.0.1",
+                    securityPolicy = ProxySecurityPolicy(blockLoopbackAndSelf = true),
+                )
+            }
+
+            // 1. HTTP CONNECT 127.0.0.1:<port> -> 403 Forbidden
+            Socket("127.0.0.1", strictProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val req = "CONNECT 127.0.0.1:${echoServer.port} HTTP/1.1\r\nHost: 127.0.0.1:${echoServer.port}\r\n\r\n"
+                client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+                client.getOutputStream().flush()
+                val response = String(client.getInputStream().readBytes(), Charsets.ISO_8859_1)
+                assertTrue("Expected 403 Forbidden on HTTP CONNECT loopback, got: $response", response.startsWith("HTTP/1.1 403 Forbidden"))
+            }
+
+            // 2. HTTP GET http://127.0.0.1:<port>/ -> 403 Forbidden
+            Socket("127.0.0.1", strictProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val req = "GET http://127.0.0.1:${echoServer.port}/secret HTTP/1.1\r\nHost: 127.0.0.1:${echoServer.port}\r\n\r\n"
+                client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+                client.getOutputStream().flush()
+                val response = String(client.getInputStream().readBytes(), Charsets.ISO_8859_1)
+                assertTrue("Expected 403 Forbidden on HTTP GET loopback, got: $response", response.startsWith("HTTP/1.1 403 Forbidden"))
+            }
+
+            // 3. SOCKS5 CONNECT 127.0.0.1:<port> -> REP = 0x02 (Connection not allowed by ruleset)
+            Socket("127.0.0.1", strictProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val input = client.getInputStream()
+                val out = client.getOutputStream()
+                out.write(byteArrayOf(0x05, 0x01, 0x00))
+                out.flush()
+                assertEquals(0x00, readExactBytes(input, 2)[1].toInt() and 0xFF)
+
+                out.write(
+                    byteArrayOf(
+                        0x05, 0x01, 0x00, 0x01,
+                        127, 0, 0, 1,
+                        ((echoServer.port ushr 8) and 0xFF).toByte(),
+                        (echoServer.port and 0xFF).toByte(),
+                    ),
+                )
+                out.flush()
+                val reply = readSocks5Reply(input)
+                assertEquals(0x05, reply.ver)
+                assertEquals(0x02, reply.rep)
+            }
+
+            // 4. SOCKS5 CONNECT domain "localhost" -> REP = 0x02
+            Socket("127.0.0.1", strictProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val input = client.getInputStream()
+                val out = client.getOutputStream()
+                out.write(byteArrayOf(0x05, 0x01, 0x00))
+                out.flush()
+                assertEquals(0x00, readExactBytes(input, 2)[1].toInt() and 0xFF)
+
+                val domain = "localhost".toByteArray(Charsets.UTF_8)
+                val connectReq = ByteArrayOutputStream().apply {
+                    write(byteArrayOf(0x05, 0x01, 0x00, 0x03, domain.size.toByte()))
+                    write(domain)
+                    write((echoServer.port ushr 8) and 0xFF)
+                    write(echoServer.port and 0xFF)
+                }.toByteArray()
+                out.write(connectReq)
+                out.flush()
+                val reply = readSocks5Reply(input)
+                assertEquals(0x02, reply.rep)
+            }
+
+            // 5. SOCKS4 CONNECT 127.0.0.1:<port> -> 0x00, 0x5B
+            Socket("127.0.0.1", strictProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val input = client.getInputStream()
+                val out = client.getOutputStream()
+                val req = byteArrayOf(
+                    0x04, 0x01,
+                    ((echoServer.port ushr 8) and 0xFF).toByte(),
+                    (echoServer.port and 0xFF).toByte(),
+                    127, 0, 0, 1,
+                    0x00,
+                )
+                out.write(req)
+                out.flush()
+                val reply = readExactBytes(input, 8)
+                assertEquals(0x00, reply[0].toInt() and 0xFF)
+                assertEquals(0x5B, reply[1].toInt() and 0xFF)
+            }
+
+            // 6. SOCKS5 UDP ASSOCIATE to 127.0.0.1:<udpEchoPort> -> datagram dropped
+            Socket("127.0.0.1", strictProxy.boundPort).use { controlSocket ->
+                controlSocket.soTimeout = 5_000
+                val input = controlSocket.getInputStream()
+                val out = controlSocket.getOutputStream()
+                out.write(byteArrayOf(0x05, 0x01, 0x00))
+                out.flush()
+                assertEquals(0x00, readExactBytes(input, 2)[1].toInt() and 0xFF)
+
+                out.write(byteArrayOf(0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                out.flush()
+                val reply = readSocks5Reply(input)
+                assertEquals(0x00, reply.rep)
+
+                DatagramSocket().use { clientUdp ->
+                    clientUdp.soTimeout = 400
+                    val udpEchoPort = udpEchoSocket.localPort
+                    val payload = "blocked-udp-loopback".toByteArray(Charsets.UTF_8)
+                    val pktBytes = ByteArrayOutputStream().apply {
+                        write(byteArrayOf(0x00, 0x00, 0x00, 0x01, 127, 0, 0, 1))
+                        write((udpEchoPort ushr 8) and 0xFF)
+                        write(udpEchoPort and 0xFF)
+                        write(payload)
+                    }.toByteArray()
+                    clientUdp.send(DatagramPacket(pktBytes, pktBytes.size, reply.bindAddress, reply.bindPort))
+
+                    var timedOut = false
+                    try {
+                        val recv = DatagramPacket(ByteArray(1024), 1024)
+                        clientUdp.receive(recv)
+                    } catch (_: SocketTimeoutException) {
+                        timedOut = true
+                    }
+                    assertTrue("UDP datagram targeting 127.0.0.1 must be dropped", timedOut)
+                    assertEquals("Local UDP server must not receive blocked datagram", 0, udpReceivedCount.get())
+                }
+            }
+        } finally {
+            strictProxy.stop()
+            echoServer.close()
+            udpEchoSocket.close()
+            udpThread.join(1_000)
+        }
+    }
+
+    @Test
+    fun httpProxyAuthenticationEnforcesBasicAuthAndStripsCredentialsUpstream() {
+        val authProxy = HybridProxyServer(TrafficStatsTracker())
+        val echoServer = startTcpEchoServer()
+        val capturedHeaders = AtomicReference<Map<String, String>>()
+        val originServer = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
+        val originThread = thread(isDaemon = true) {
+            try {
+                originServer.accept().use { socket ->
+                    val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.ISO_8859_1))
+                    reader.readLine() // request line
+                    val headers = mutableMapOf<String, String>()
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        if (line.isEmpty()) break
+                        val idx = line.indexOf(':')
+                        if (idx > 0) {
+                            headers[line.substring(0, idx).trim().lowercase()] = line.substring(idx + 1).trim()
+                        }
+                    }
+                    capturedHeaders.set(headers)
+                    val body = "auth-ok"
+                    val resp = "HTTP/1.1 200 OK\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n$body"
+                    socket.getOutputStream().write(resp.toByteArray(Charsets.ISO_8859_1))
+                    socket.getOutputStream().flush()
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        try {
+            runBlocking {
+                authProxy.start(
+                    port = 0,
+                    bindAddress = "127.0.0.1",
+                    securityPolicy = ProxySecurityPolicy(
+                        blockLoopbackAndSelf = false,
+                        authEnabled = true,
+                        authUsername = "router",
+                        authPassword = "s3cr3t:pass",
+                    ),
+                )
+            }
+
+            // 1. CONNECT without credentials -> 407 Proxy Authentication Required
+            Socket("127.0.0.1", authProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val req = "CONNECT 127.0.0.1:${echoServer.port} HTTP/1.1\r\nHost: 127.0.0.1:${echoServer.port}\r\n\r\n"
+                client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+                client.getOutputStream().flush()
+                val resp = String(client.getInputStream().readBytes(), Charsets.ISO_8859_1)
+                assertTrue("Expected 407, got: $resp", resp.startsWith("HTTP/1.1 407 Proxy Authentication Required"))
+                assertTrue("Expected Basic realm header, got: $resp", resp.contains("Proxy-Authenticate: Basic realm=\"DirectRouter\""))
+            }
+
+            // 2. CONNECT with wrong credentials -> 407
+            val badToken = Base64.getEncoder().encodeToString("router:wrong".toByteArray(Charsets.UTF_8))
+            Socket("127.0.0.1", authProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val req = buildString {
+                    append("CONNECT 127.0.0.1:${echoServer.port} HTTP/1.1\r\n")
+                    append("Host: 127.0.0.1:${echoServer.port}\r\n")
+                    append("Proxy-Authorization: Basic $badToken\r\n\r\n")
+                }
+                client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+                client.getOutputStream().flush()
+                val resp = String(client.getInputStream().readBytes(), Charsets.ISO_8859_1)
+                assertTrue("Expected 407 on wrong password, got: $resp", resp.startsWith("HTTP/1.1 407"))
+            }
+
+            // 3. CONNECT with valid credentials -> 200 and tunnel works
+            val validToken = Base64.getEncoder().encodeToString("router:s3cr3t:pass".toByteArray(Charsets.UTF_8))
+            Socket("127.0.0.1", authProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val out = client.getOutputStream()
+                val input = client.getInputStream()
+                val req = buildString {
+                    append("CONNECT 127.0.0.1:${echoServer.port} HTTP/1.1\r\n")
+                    append("Host: 127.0.0.1:${echoServer.port}\r\n")
+                    append("Proxy-Authorization: Basic $validToken\r\n\r\n")
+                }
+                out.write(req.toByteArray(Charsets.ISO_8859_1))
+                out.flush()
+                val headers = readHttpHeadersRaw(input)
+                assertTrue("Expected 200 OK, got: $headers", headers.firstOrNull()?.startsWith("HTTP/1.1 200") == true)
+
+                val payload = "authenticated-tunnel-data"
+                out.write(payload.toByteArray(Charsets.UTF_8))
+                out.flush()
+                client.shutdownOutput()
+                assertEquals(payload, String(input.readBytes(), Charsets.UTF_8))
+            }
+
+            // 4. Plain HTTP GET without credentials -> 407
+            Socket("127.0.0.1", authProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val req = "GET http://127.0.0.1:${originServer.localPort}/check HTTP/1.1\r\nHost: 127.0.0.1:${originServer.localPort}\r\n\r\n"
+                client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+                client.getOutputStream().flush()
+                val resp = String(client.getInputStream().readBytes(), Charsets.ISO_8859_1)
+                assertTrue("Expected 407 on unauthenticated GET, got: $resp", resp.startsWith("HTTP/1.1 407"))
+            }
+
+            // 5. Plain HTTP GET with valid credentials -> 200 OK and Proxy-Authorization stripped upstream
+            Socket("127.0.0.1", authProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val req = buildString {
+                    append("GET http://127.0.0.1:${originServer.localPort}/check HTTP/1.1\r\n")
+                    append("Host: 127.0.0.1:${originServer.localPort}\r\n")
+                    append("Proxy-Authorization: Basic $validToken\r\n\r\n")
+                }
+                client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+                client.getOutputStream().flush()
+                val resp = String(client.getInputStream().readBytes(), Charsets.ISO_8859_1)
+                assertTrue("Expected 200 OK, got: $resp", resp.startsWith("HTTP/1.1 200 OK"))
+                assertTrue(resp.endsWith("auth-ok"))
+            }
+            assertFalse(
+                "Proxy-Authorization must never be forwarded upstream",
+                capturedHeaders.get().containsKey("proxy-authorization"),
+            )
+
+            // 6. Local /proxy.pac remains readable for Android Wi-Fi PAC autoconfig
+            Socket("127.0.0.1", authProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val req = "GET /proxy.pac HTTP/1.1\r\nHost: 127.0.0.1:${authProxy.boundPort}\r\n\r\n"
+                client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+                client.getOutputStream().flush()
+                val resp = String(client.getInputStream().readBytes(), Charsets.UTF_8)
+                assertTrue(resp.startsWith("HTTP/1.1 200 OK"))
+                assertTrue(resp.contains("PROXY 127.0.0.1:${authProxy.boundPort}; DIRECT"))
+            }
+        } finally {
+            authProxy.stop()
+            echoServer.close()
+            originServer.close()
+            originThread.join(1_000)
+        }
+    }
+
+    @Test
+    fun socks5AuthenticationEnforcesRfc1929AndRejectsSocks4WhenAuthEnabled() {
+        val authProxy = HybridProxyServer(TrafficStatsTracker())
+        val echoServer = startTcpEchoServer()
+        try {
+            runBlocking {
+                authProxy.start(
+                    port = 0,
+                    bindAddress = "127.0.0.1",
+                    securityPolicy = ProxySecurityPolicy(
+                        blockLoopbackAndSelf = false,
+                        authEnabled = true,
+                        authUsername = "alice",
+                        authPassword = "secret123",
+                    ),
+                )
+            }
+
+            // 1. SOCKS5 offering only NO_AUTH (0x00) -> rejected with 0x05, 0xFF
+            Socket("127.0.0.1", authProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val out = client.getOutputStream()
+                val input = client.getInputStream()
+                out.write(byteArrayOf(0x05, 0x01, 0x00))
+                out.flush()
+                val reply = readExactBytes(input, 2)
+                assertEquals(0x05, reply[0].toInt() and 0xFF)
+                assertEquals(0xFF, reply[1].toInt() and 0xFF)
+            }
+
+            // 2. SOCKS5 offering 0x02 with wrong credentials -> 0x05 0x02, then 0x01 0x01
+            Socket("127.0.0.1", authProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val out = client.getOutputStream()
+                val input = client.getInputStream()
+                out.write(byteArrayOf(0x05, 0x01, 0x02))
+                out.flush()
+                val methodReply = readExactBytes(input, 2)
+                assertEquals(0x05, methodReply[0].toInt() and 0xFF)
+                assertEquals(0x02, methodReply[1].toInt() and 0xFF)
+
+                val user = "alice".toByteArray(Charsets.UTF_8)
+                val badPass = "wrongpass".toByteArray(Charsets.UTF_8)
+                val authReq = ByteArrayOutputStream().apply {
+                    write(0x01)
+                    write(user.size)
+                    write(user)
+                    write(badPass.size)
+                    write(badPass)
+                }.toByteArray()
+                out.write(authReq)
+                out.flush()
+
+                val authStatus = readExactBytes(input, 2)
+                assertEquals(0x01, authStatus[0].toInt() and 0xFF)
+                assertEquals(0x01, authStatus[1].toInt() and 0xFF)
+            }
+
+            // 3. SOCKS5 with valid RFC 1929 credentials -> 0x05 0x02, 0x01 0x00, CONNECT succeeds
+            Socket("127.0.0.1", authProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val out = client.getOutputStream()
+                val input = client.getInputStream()
+                out.write(byteArrayOf(0x05, 0x02, 0x00, 0x02))
+                out.flush()
+                val methodReply = readExactBytes(input, 2)
+                assertEquals(0x05, methodReply[0].toInt() and 0xFF)
+                assertEquals(0x02, methodReply[1].toInt() and 0xFF)
+
+                val user = "alice".toByteArray(Charsets.UTF_8)
+                val pass = "secret123".toByteArray(Charsets.UTF_8)
+                val authReq = ByteArrayOutputStream().apply {
+                    write(0x01)
+                    write(user.size)
+                    write(user)
+                    write(pass.size)
+                    write(pass)
+                }.toByteArray()
+                out.write(authReq)
+                out.flush()
+
+                val authStatus = readExactBytes(input, 2)
+                assertEquals(0x01, authStatus[0].toInt() and 0xFF)
+                assertEquals(0x00, authStatus[1].toInt() and 0xFF)
+
+                out.write(
+                    byteArrayOf(
+                        0x05, 0x01, 0x00, 0x01,
+                        127, 0, 0, 1,
+                        ((echoServer.port ushr 8) and 0xFF).toByte(),
+                        (echoServer.port and 0xFF).toByte(),
+                    ),
+                )
+                out.flush()
+                val connectReply = readSocks5Reply(input)
+                assertEquals(0x00, connectReply.rep)
+
+                val payload = "socks5-rfc1929-auth-ok"
+                out.write(payload.toByteArray(Charsets.UTF_8))
+                out.flush()
+                client.shutdownOutput()
+                assertEquals(payload, String(input.readBytes(), Charsets.UTF_8))
+            }
+
+            // 4. SOCKS4 rejected immediately when authEnabled = true
+            Socket("127.0.0.1", authProxy.boundPort).use { client ->
+                client.soTimeout = 5_000
+                val out = client.getOutputStream()
+                val input = client.getInputStream()
+                val socks4Req = byteArrayOf(
+                    0x04, 0x01,
+                    ((echoServer.port ushr 8) and 0xFF).toByte(),
+                    (echoServer.port and 0xFF).toByte(),
+                    127, 0, 0, 1,
+                    0x00,
+                )
+                out.write(socks4Req)
+                out.flush()
+
+                val reply = readExactBytes(input, 8)
+                assertEquals(0x00, reply[0].toInt() and 0xFF)
+                assertEquals(0x5B, reply[1].toInt() and 0xFF)
+                assertEquals(-1, input.read())
+            }
+        } finally {
+            authProxy.stop()
+            echoServer.close()
+        }
+    }
+
+    @Test
+    fun concurrentConnectionLimitRejectsExcessAndReleasesPermitsOnClose() {
+        val limitedStats = TrafficStatsTracker()
+        val limitedProxy = HybridProxyServer(limitedStats)
+        val echoServer = startTcpEchoServer()
+        val tunnel1: Socket
+        val tunnel2: Socket
+        try {
+            runBlocking {
+                limitedProxy.start(
+                    port = 0,
+                    bindAddress = "127.0.0.1",
+                    securityPolicy = ProxySecurityPolicy(
+                        blockLoopbackAndSelf = false,
+                        maxConcurrentConnections = 2,
+                    ),
+                )
+            }
+
+            fun openConnectTunnel(): Socket {
+                val sock = Socket("127.0.0.1", limitedProxy.boundPort)
+                sock.soTimeout = 5_000
+                val req = "CONNECT 127.0.0.1:${echoServer.port} HTTP/1.1\r\nHost: 127.0.0.1:${echoServer.port}\r\n\r\n"
+                sock.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+                sock.getOutputStream().flush()
+                val headers = readHttpHeadersRaw(sock.getInputStream())
+                assertTrue("Expected 200 Connection Established, got: $headers", headers.firstOrNull()?.startsWith("HTTP/1.1 200") == true)
+                return sock
+            }
+
+            tunnel1 = openConnectTunnel()
+            tunnel2 = openConnectTunnel()
+            try {
+                // 3rd connection must be rejected cleanly while 2 permits are held
+                Socket("127.0.0.1", limitedProxy.boundPort).use { excessClient ->
+                    excessClient.soTimeout = 2_000
+                    val rejected = try {
+                        val req = "CONNECT 127.0.0.1:${echoServer.port} HTTP/1.1\r\nHost: 127.0.0.1:${echoServer.port}\r\n\r\n"
+                        excessClient.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+                        excessClient.getOutputStream().flush()
+                        val firstRead = excessClient.getInputStream().read()
+                        firstRead == -1
+                    } catch (_: IOException) {
+                        true
+                    }
+                    assertTrue("3rd concurrent connection must be rejected when limit is 2", rejected)
+                }
+            } finally {
+                runCatching { tunnel1.close() }
+                runCatching { tunnel2.close() }
+            }
+
+            // Wait for permits and active connections to release
+            val deadline = System.currentTimeMillis() + 3_000L
+            while (System.currentTimeMillis() < deadline && limitedStats.snapshot.value.activeConnections > 0) {
+                Thread.sleep(25L)
+            }
+            assertEquals(0, limitedStats.snapshot.value.activeConnections)
+
+            // New connection must now succeed
+            openConnectTunnel().use { tunnel3 ->
+                val payload = "permit-released-ok"
+                tunnel3.getOutputStream().write(payload.toByteArray(Charsets.UTF_8))
+                tunnel3.getOutputStream().flush()
+                tunnel3.shutdownOutput()
+                val echoed = String(tunnel3.getInputStream().readBytes(), Charsets.UTF_8)
+                assertEquals(payload, echoed)
+            }
+        } finally {
+            limitedProxy.stop()
+            echoServer.close()
+        }
+    }
+
+    @Test
+    fun pacEndpointSanitizesMaliciousHostHeaderAndFallsBackToLocalIp() {
+        // 1. JS injection payload in Host header is rejected and replaced with safe local socket IP
+        Socket("127.0.0.1", proxyServer.boundPort).use { client ->
+            client.soTimeout = 5_000
+            val maliciousHost = "192.168.49.1\"; alert(1);//"
+            val req = "GET /proxy.pac HTTP/1.1\r\nHost: $maliciousHost\r\n\r\n"
+            client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+            client.getOutputStream().flush()
+
+            val rawResponse = String(client.getInputStream().readBytes(), Charsets.UTF_8)
+            assertTrue("Expected 200 OK, got: $rawResponse", rawResponse.startsWith("HTTP/1.1 200 OK"))
+            assertFalse("PAC must not reflect JS injection payload", rawResponse.contains("alert(1)"))
+            assertFalse("PAC must not reflect unvalidated Host IP", rawResponse.contains("192.168.49.1"))
+            assertTrue(
+                "PAC must fall back to local socket IP, got: $rawResponse",
+                rawResponse.contains("PROXY 127.0.0.1:${proxyServer.boundPort}; DIRECT"),
+            )
+        }
+
+        // 2. Valid bracketed IPv6 Host header is preserved safely
+        Socket("127.0.0.1", proxyServer.boundPort).use { client ->
+            client.soTimeout = 5_000
+            val req = "GET /proxy.pac HTTP/1.1\r\nHost: [2001:db8::1]:${proxyServer.boundPort}\r\n\r\n"
+            client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+            client.getOutputStream().flush()
+
+            val rawResponse = String(client.getInputStream().readBytes(), Charsets.UTF_8)
+            assertTrue("Expected 200 OK, got: $rawResponse", rawResponse.startsWith("HTTP/1.1 200 OK"))
+            assertTrue(
+                "PAC must properly format bracketed IPv6 host, got: $rawResponse",
+                rawResponse.contains("PROXY [2001:db8::1]:${proxyServer.boundPort}; DIRECT"),
+            )
         }
     }
 

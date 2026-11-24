@@ -18,6 +18,7 @@ internal object OutboundConnector {
 
     sealed class ConnectResult {
         data class Success(val socket: Socket) : ConnectResult()
+        data class Blocked(val reason: String) : ConnectResult()
         data class Failure(val error: Exception) : ConnectResult()
     }
 
@@ -32,10 +33,24 @@ internal object OutboundConnector {
         host: String,
         port: Int,
         connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
+        securityPolicy: ProxySecurityPolicy = ProxySecurityPolicy(),
+        proxyBoundPort: Int = 0,
+        localAddresses: Set<InetAddress> = emptySet(),
     ): Socket? {
-        return when (val result = connectWithResult(host, port, connectTimeoutMs)) {
+        return when (
+            val result = connectWithResult(
+                host = host,
+                port = port,
+                connectTimeoutMs = connectTimeoutMs,
+                securityPolicy = securityPolicy,
+                proxyBoundPort = proxyBoundPort,
+                localAddresses = localAddresses,
+            )
+        ) {
             is ConnectResult.Success -> result.socket
-            is ConnectResult.Failure -> null
+            is ConnectResult.Blocked,
+            is ConnectResult.Failure,
+            -> null
         }
     }
 
@@ -43,6 +58,9 @@ internal object OutboundConnector {
         host: String,
         port: Int,
         connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
+        securityPolicy: ProxySecurityPolicy = ProxySecurityPolicy(),
+        proxyBoundPort: Int = 0,
+        localAddresses: Set<InetAddress> = emptySet(),
     ): ConnectResult {
         val trimmedHost = host.trim()
         if (trimmedHost.isEmpty() || port !in 1..65535) {
@@ -61,7 +79,14 @@ internal object OutboundConnector {
             return ConnectResult.Failure(UnknownHostException(trimmedHost))
         }
 
-        val candidates = selectCandidates(resolved)
+        val allowed = resolved.filterNot { candidate ->
+            securityPolicy.isTargetBlocked(candidate, port, proxyBoundPort, localAddresses)
+        }
+        if (allowed.isEmpty()) {
+            return ConnectResult.Blocked("Target $trimmedHost:$port blocked by security policy")
+        }
+
+        val candidates = selectCandidates(allowed)
         val perAttemptTimeout = if (candidates.size > 1) {
             minOf(connectTimeoutMs, MULTI_CANDIDATE_TIMEOUT_MS).coerceAtLeast(1_000)
         } else {
@@ -70,8 +95,12 @@ internal object OutboundConnector {
 
         var lastError: Exception = IOException("Failed to connect to $trimmedHost:$port")
         for (candidate in candidates) {
+            if (securityPolicy.isTargetBlocked(candidate, port, proxyBoundPort, localAddresses)) {
+                continue
+            }
             when (val attempt = connectSingle(candidate, port, perAttemptTimeout)) {
                 is ConnectResult.Success -> return attempt
+                is ConnectResult.Blocked -> return attempt
                 is ConnectResult.Failure -> lastError = attempt.error
             }
         }
@@ -82,11 +111,18 @@ internal object OutboundConnector {
         address: InetAddress,
         port: Int,
         connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
+        securityPolicy: ProxySecurityPolicy = ProxySecurityPolicy(),
+        proxyBoundPort: Int = 0,
+        localAddresses: Set<InetAddress> = emptySet(),
     ): ConnectResult {
         if (port !in 1..65535) {
             return ConnectResult.Failure(IllegalArgumentException("Invalid port $port"))
         }
-        return connectSingle(unwrapIpv4Mapped(address), port, connectTimeoutMs.coerceAtLeast(1_000))
+        val unwrapped = unwrapIpv4Mapped(address)
+        if (securityPolicy.isTargetBlocked(unwrapped, port, proxyBoundPort, localAddresses)) {
+            return ConnectResult.Blocked("Target ${unwrapped.hostAddress}:$port blocked by security policy")
+        }
+        return connectSingle(unwrapped, port, connectTimeoutMs.coerceAtLeast(1_000))
     }
 
     @Throws(UnknownHostException::class)

@@ -25,7 +25,12 @@ import java.util.concurrent.atomic.AtomicReference
 internal object Socks5Handler {
     private const val SOCKS_VERSION = 0x05
     private const val AUTH_NO_AUTH = 0x00
+    private const val AUTH_USER_PASS = 0x02
     private const val AUTH_NO_ACCEPTABLE = 0xFF
+
+    private const val USER_PASS_AUTH_VERSION = 0x01
+    private const val USER_PASS_STATUS_SUCCESS = 0x00
+    private const val USER_PASS_STATUS_FAILURE = 0x01
 
     private const val CMD_CONNECT = 0x01
     private const val CMD_UDP_ASSOCIATE = 0x03
@@ -36,6 +41,7 @@ internal object Socks5Handler {
 
     private const val REP_SUCCEEDED = 0x00
     private const val REP_GENERAL_FAILURE = 0x01
+    private const val REP_CONNECTION_NOT_ALLOWED = 0x02
     private const val REP_HOST_UNREACHABLE = 0x04
     private const val REP_CONNECTION_REFUSED = 0x05
     private const val REP_COMMAND_NOT_SUPPORTED = 0x07
@@ -59,8 +65,11 @@ internal object Socks5Handler {
         statsTracker: TrafficStatsTracker,
         @Suppress("UNUSED_PARAMETER") scope: CoroutineScope,
         dispatcher: CoroutineDispatcher,
+        securityPolicy: ProxySecurityPolicy = ProxySecurityPolicy(),
+        proxyBoundPort: Int = clientSocket.localPort,
+        localAddresses: Set<InetAddress> = emptySet(),
     ) {
-        if (!negotiateAuth(clientIn, clientOut)) {
+        if (!negotiateAuth(clientIn, clientOut, securityPolicy)) {
             return
         }
 
@@ -128,6 +137,9 @@ internal object Socks5Handler {
                 clientOut = clientOut,
                 statsTracker = statsTracker,
                 dispatcher = dispatcher,
+                securityPolicy = securityPolicy,
+                proxyBoundPort = proxyBoundPort,
+                localAddresses = localAddresses,
             )
 
             CMD_UDP_ASSOCIATE -> handleUdpAssociate(
@@ -137,6 +149,9 @@ internal object Socks5Handler {
                 clientOut = clientOut,
                 statsTracker = statsTracker,
                 dispatcher = dispatcher,
+                securityPolicy = securityPolicy,
+                proxyBoundPort = proxyBoundPort,
+                localAddresses = localAddresses,
             )
 
             else -> {
@@ -145,7 +160,11 @@ internal object Socks5Handler {
         }
     }
 
-    private fun negotiateAuth(clientIn: InputStream, clientOut: OutputStream): Boolean {
+    private fun negotiateAuth(
+        clientIn: InputStream,
+        clientOut: OutputStream,
+        securityPolicy: ProxySecurityPolicy,
+    ): Boolean {
         val ver = clientIn.read()
         if (ver != SOCKS_VERSION) return false
 
@@ -153,8 +172,64 @@ internal object Socks5Handler {
         if (nMethods <= 0) return false
 
         val methods = readExact(clientIn, nMethods) ?: return false
-        val supportsNoAuth = methods.any { (it.toInt() and 0xFF) == AUTH_NO_AUTH }
 
+        if (securityPolicy.authEnabled) {
+            val supportsUserPass = methods.any { (it.toInt() and 0xFF) == AUTH_USER_PASS }
+            if (!supportsUserPass) {
+                clientOut.write(byteArrayOf(SOCKS_VERSION.toByte(), AUTH_NO_ACCEPTABLE.toByte()))
+                clientOut.flush()
+                return false
+            }
+
+            clientOut.write(byteArrayOf(SOCKS_VERSION.toByte(), AUTH_USER_PASS.toByte()))
+            clientOut.flush()
+
+            // RFC 1929 Username/Password subnegotiation
+            val subVer = clientIn.read()
+            if (subVer != USER_PASS_AUTH_VERSION) {
+                clientOut.write(
+                    byteArrayOf(
+                        USER_PASS_AUTH_VERSION.toByte(),
+                        USER_PASS_STATUS_FAILURE.toByte(),
+                    ),
+                )
+                clientOut.flush()
+                return false
+            }
+
+            val uLen = clientIn.read()
+            if (uLen < 0) return false
+            val userBytes = if (uLen == 0) ByteArray(0) else readExact(clientIn, uLen) ?: return false
+
+            val pLen = clientIn.read()
+            if (pLen < 0) return false
+            val passBytes = if (pLen == 0) ByteArray(0) else readExact(clientIn, pLen) ?: return false
+
+            val username = String(userBytes, Charsets.UTF_8)
+            val password = String(passBytes, Charsets.UTF_8)
+
+            return if (securityPolicy.verifyCredentials(username, password)) {
+                clientOut.write(
+                    byteArrayOf(
+                        USER_PASS_AUTH_VERSION.toByte(),
+                        USER_PASS_STATUS_SUCCESS.toByte(),
+                    ),
+                )
+                clientOut.flush()
+                true
+            } else {
+                clientOut.write(
+                    byteArrayOf(
+                        USER_PASS_AUTH_VERSION.toByte(),
+                        USER_PASS_STATUS_FAILURE.toByte(),
+                    ),
+                )
+                clientOut.flush()
+                false
+            }
+        }
+
+        val supportsNoAuth = methods.any { (it.toInt() and 0xFF) == AUTH_NO_AUTH }
         return if (supportsNoAuth) {
             clientOut.write(byteArrayOf(SOCKS_VERSION.toByte(), AUTH_NO_AUTH.toByte()))
             clientOut.flush()
@@ -173,15 +248,34 @@ internal object Socks5Handler {
         clientOut: OutputStream,
         statsTracker: TrafficStatsTracker,
         dispatcher: CoroutineDispatcher,
+        securityPolicy: ProxySecurityPolicy,
+        proxyBoundPort: Int,
+        localAddresses: Set<InetAddress>,
     ) {
         val connectResult = if (destination.resolvedAddress != null) {
-            OutboundConnector.connectWithResult(destination.resolvedAddress, destination.port)
+            OutboundConnector.connectWithResult(
+                address = destination.resolvedAddress,
+                port = destination.port,
+                securityPolicy = securityPolicy,
+                proxyBoundPort = proxyBoundPort,
+                localAddresses = localAddresses,
+            )
         } else {
-            OutboundConnector.connectWithResult(destination.host, destination.port)
+            OutboundConnector.connectWithResult(
+                host = destination.host,
+                port = destination.port,
+                securityPolicy = securityPolicy,
+                proxyBoundPort = proxyBoundPort,
+                localAddresses = localAddresses,
+            )
         }
 
         val remoteSocket = when (connectResult) {
             is OutboundConnector.ConnectResult.Success -> connectResult.socket
+            is OutboundConnector.ConnectResult.Blocked -> {
+                sendReply(clientOut, REP_CONNECTION_NOT_ALLOWED, null, 0)
+                return
+            }
             is OutboundConnector.ConnectResult.Failure -> {
                 val replyCode = when (connectResult.error) {
                     is ConnectException -> REP_CONNECTION_REFUSED
@@ -226,6 +320,9 @@ internal object Socks5Handler {
         clientOut: OutputStream,
         statsTracker: TrafficStatsTracker,
         dispatcher: CoroutineDispatcher,
+        securityPolicy: ProxySecurityPolicy,
+        proxyBoundPort: Int,
+        localAddresses: Set<InetAddress>,
     ) {
         val bindAddr = normalizeLocalBindAddress(clientSocket.localAddress)
         val clientUdpSocket = try {
@@ -288,10 +385,21 @@ internal object Socks5Handler {
                         val dataLen = packet.length - parsed.dataOffset
                         if (dataLen < 0 || parsed.port !in 1..65535) continue
 
-                        val targetAddr = parsed.resolvedAddress ?: try {
-                            OutboundConnector.resolveFirst(parsed.host)
-                        } catch (_: IOException) {
-                            continue
+                        val targetAddr = if (parsed.resolvedAddress != null) {
+                            val unwrapped = OutboundConnector.unwrapIpv4Mapped(parsed.resolvedAddress)
+                            if (securityPolicy.isTargetBlocked(unwrapped, parsed.port, proxyBoundPort, localAddresses)) {
+                                continue
+                            }
+                            unwrapped
+                        } else {
+                            val resolvedCandidates = try {
+                                OutboundConnector.resolveOrdered(parsed.host)
+                            } catch (_: IOException) {
+                                continue
+                            }
+                            resolvedCandidates.firstOrNull { candidate ->
+                                !securityPolicy.isTargetBlocked(candidate, parsed.port, proxyBoundPort, localAddresses)
+                            } ?: continue
                         }
 
                         try {

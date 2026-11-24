@@ -18,12 +18,14 @@ import java.io.OutputStream
 import java.io.PushbackInputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.ThreadPoolExecutor
@@ -51,6 +53,12 @@ class HybridProxyServer(
     @Volatile
     private var proxyDispatcher: ExecutorCoroutineDispatcher? = null
 
+    @Volatile
+    private var activeSecurityPolicy: ProxySecurityPolicy = ProxySecurityPolicy()
+
+    @Volatile
+    private var activeLocalAddresses: Set<InetAddress> = emptySet()
+
     private val activeClientSockets: MutableSet<Socket> =
         Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
 
@@ -60,7 +68,15 @@ class HybridProxyServer(
     val boundPort: Int
         get() = boundPortRef.get()
 
-    suspend fun start(port: Int, bindAddress: String = "0.0.0.0") {
+    val securityPolicy: ProxySecurityPolicy
+        get() = activeSecurityPolicy
+
+    suspend fun start(
+        port: Int,
+        bindAddress: String = "0.0.0.0",
+        securityPolicy: ProxySecurityPolicy = ProxySecurityPolicy(),
+        localAddresses: Set<InetAddress> = emptySet(),
+    ) {
         withContext(Dispatchers.IO) {
             synchronized(lifecycleLock) {
                 if (running.get()) {
@@ -76,18 +92,31 @@ class HybridProxyServer(
                 val executor = createProxyExecutor()
                 val dispatcher = executor.asCoroutineDispatcher()
                 val scope = CoroutineScope(SupervisorJob() + dispatcher)
+                val resolvedLocalAddresses = collectLocalAddresses(bindInetAddress, localAddresses)
+                val connectionSemaphore = Semaphore(securityPolicy.effectiveMaxConcurrentConnections())
+                val actualBoundPort = socket.localPort
 
                 serverSocket = socket
                 proxyExecutor = executor
                 proxyDispatcher = dispatcher
                 serverScope = scope
-                boundPortRef.set(socket.localPort)
+                activeSecurityPolicy = securityPolicy
+                activeLocalAddresses = resolvedLocalAddresses
+                boundPortRef.set(actualBoundPort)
                 running.set(true)
 
                 statsTracker.start(scope)
 
                 scope.launch(dispatcher) {
-                    acceptLoop(socket, scope, dispatcher)
+                    acceptLoop(
+                        server = socket,
+                        scope = scope,
+                        dispatcher = dispatcher,
+                        securityPolicy = securityPolicy,
+                        proxyBoundPort = actualBoundPort,
+                        localAddresses = resolvedLocalAddresses,
+                        connectionSemaphore = connectionSemaphore,
+                    )
                 }
             }
         }
@@ -109,6 +138,7 @@ class HybridProxyServer(
                 return
             }
             boundPortRef.set(0)
+            activeLocalAddresses = emptySet()
             socketToClose = serverSocket
             serverSocket = null
             scopeToCancel = serverScope
@@ -129,6 +159,37 @@ class HybridProxyServer(
         scopeToCancel?.cancel()
         runCatching { executorToShutdown?.shutdownNow() }
         runCatching { dispatcherToClose?.close() }
+    }
+
+    private fun collectLocalAddresses(
+        bindInetAddress: InetAddress,
+        extraLocalAddresses: Set<InetAddress>,
+    ): Set<InetAddress> {
+        val result = LinkedHashSet<InetAddress>()
+        val unwrappedBind = OutboundConnector.unwrapIpv4Mapped(bindInetAddress)
+        if (!unwrappedBind.isAnyLocalAddress) {
+            result.add(unwrappedBind)
+        }
+        for (addr in extraLocalAddresses) {
+            val unwrapped = OutboundConnector.unwrapIpv4Mapped(addr)
+            if (!unwrapped.isAnyLocalAddress) {
+                result.add(unwrapped)
+            }
+        }
+        runCatching {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return@runCatching
+            while (interfaces.hasMoreElements()) {
+                val nif = interfaces.nextElement()
+                val addrs = nif.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val unwrapped = OutboundConnector.unwrapIpv4Mapped(addrs.nextElement())
+                    if (!unwrapped.isAnyLocalAddress) {
+                        result.add(unwrapped)
+                    }
+                }
+            }
+        }
+        return Collections.unmodifiableSet(result)
     }
 
     private fun createProxyExecutor(): ThreadPoolExecutor {
@@ -153,6 +214,10 @@ class HybridProxyServer(
         server: ServerSocket,
         scope: CoroutineScope,
         dispatcher: CoroutineDispatcher,
+        securityPolicy: ProxySecurityPolicy,
+        proxyBoundPort: Int,
+        localAddresses: Set<InetAddress>,
+        connectionSemaphore: Semaphore,
     ) {
         while (running.get() && !server.isClosed && scope.isActive) {
             val clientSocket = try {
@@ -169,9 +234,40 @@ class HybridProxyServer(
                 break
             }
 
+            if (!connectionSemaphore.tryAcquire()) {
+                runCatching { clientSocket.close() }
+                continue
+            }
+
+            val permitReleased = AtomicBoolean(false)
+            fun releasePermitOnce() {
+                if (permitReleased.compareAndSet(false, true)) {
+                    connectionSemaphore.release()
+                }
+            }
+
             activeClientSockets.add(clientSocket)
-            scope.launch(dispatcher) {
-                handleClient(clientSocket, scope, dispatcher)
+            try {
+                val job = scope.launch(dispatcher) {
+                    handleClient(
+                        clientSocket = clientSocket,
+                        scope = scope,
+                        dispatcher = dispatcher,
+                        securityPolicy = securityPolicy,
+                        proxyBoundPort = proxyBoundPort,
+                        localAddresses = localAddresses,
+                        onReleasePermit = ::releasePermitOnce,
+                    )
+                }
+                job.invokeOnCompletion {
+                    activeClientSockets.remove(clientSocket)
+                    runCatching { clientSocket.close() }
+                    releasePermitOnce()
+                }
+            } catch (_: Throwable) {
+                activeClientSockets.remove(clientSocket)
+                runCatching { clientSocket.close() }
+                releasePermitOnce()
             }
         }
     }
@@ -180,6 +276,10 @@ class HybridProxyServer(
         clientSocket: Socket,
         scope: CoroutineScope,
         dispatcher: CoroutineDispatcher,
+        securityPolicy: ProxySecurityPolicy,
+        proxyBoundPort: Int,
+        localAddresses: Set<InetAddress>,
+        onReleasePermit: () -> Unit,
     ) {
         statsTracker.onConnectionOpened()
         try {
@@ -205,18 +305,28 @@ class HybridProxyServer(
                         statsTracker = statsTracker,
                         scope = scope,
                         dispatcher = dispatcher,
+                        securityPolicy = securityPolicy,
+                        proxyBoundPort = proxyBoundPort,
+                        localAddresses = localAddresses,
                     )
                 }
 
                 firstByte == SOCKS4_VERSION -> {
-                    Socks4Handler.handle(
-                        clientSocket = clientSocket,
-                        clientIn = pushbackIn,
-                        clientOut = clientOut,
-                        statsTracker = statsTracker,
-                        scope = scope,
-                        dispatcher = dispatcher,
-                    )
+                    if (securityPolicy.authEnabled) {
+                        Socks4Handler.rejectImmediately(clientOut)
+                    } else {
+                        Socks4Handler.handle(
+                            clientSocket = clientSocket,
+                            clientIn = pushbackIn,
+                            clientOut = clientOut,
+                            statsTracker = statsTracker,
+                            scope = scope,
+                            dispatcher = dispatcher,
+                            securityPolicy = securityPolicy,
+                            proxyBoundPort = proxyBoundPort,
+                            localAddresses = localAddresses,
+                        )
+                    }
                 }
 
                 isHttpMethodInitialByte(firstByte) -> {
@@ -227,6 +337,9 @@ class HybridProxyServer(
                         statsTracker = statsTracker,
                         scope = scope,
                         dispatcher = dispatcher,
+                        securityPolicy = securityPolicy,
+                        proxyBoundPort = proxyBoundPort,
+                        localAddresses = localAddresses,
                     )
                 }
 
@@ -237,6 +350,7 @@ class HybridProxyServer(
         } finally {
             activeClientSockets.remove(clientSocket)
             runCatching { clientSocket.close() }
+            onReleasePermit()
             statsTracker.onConnectionClosed()
         }
     }
