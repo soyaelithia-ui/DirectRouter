@@ -1,0 +1,24 @@
+DirectRouter is an open-source, no-root Android app that turns your phone into a Wi-Fi Direct Router or a local proxy server over Native Tethering, with a built-in SOCKS5 VPN Client mode for full traffic tunneling on a second Android device.
+
+Sharing modes:
+- Wi-Fi Direct Router: creates a local Wi-Fi Direct group with an instant Wi-Fi QR code, configurable SSID/passphrase and 2.4/5 GHz band (Android 10+), plus Auto-Proxy PAC and manual proxy details.
+- Native Tethering Proxy: shares internet over your phone's native hotspot, USB tethering, or LAN without touching Wi-Fi Direct or installing any app on client devices.
+- VPN Client Mode (2nd Android phone): uses hev-socks5-tunnel with mapdns, IPv6 support, and MTU 1500 to tunnel all device traffic (TCP, UDP, DNS, and IPv6) through the host SOCKS5 proxy.
+
+Multi-protocol single-port proxy (default port 8080):
+- HTTP and HTTPS (CONNECT)
+- WebSocket (ws:// and wss://)
+- Auto-Proxy PAC (/proxy.pac)
+- SOCKS4 / SOCKS4a
+- SOCKS5 (TCP and UDP Associate)
+
+Security and customization:
+- Safe local interface binding by default (Wi-Fi Direct or active tethering interface only) with optional specific-IP selection and random port generator.
+- Anti-SSRF protection for TCP and UDP blocking loopback, link-local, and self-proxy targets by default.
+- Optional proxy authentication (HTTP Basic and SOCKS5 RFC 1929) with constant-time credential verification and client VPN credential support.
+- Configurable concurrent connection limit and sanitized PAC output.
+- Light, Dark, AMOLED Black, and Material You (Android 12+) themes.
+- Granular notifications with live speed indicator, privacy mode (hides SSID/IP on lock screen), quick stop action, and client/error alerts.
+- Built-in OEM compatibility diagnostics for Xiaomi/HyperOS, Samsung OneUI, Huawei/Honor, and Oppo/Vivo.
+
+No root required, no trackers, no telemetry, MIT licensed.

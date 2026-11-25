@@ -1,0 +1,5 @@
+- Security hardening: safe local-interface binding by default, Anti-SSRF (TCP/UDP), optional HTTP Basic & SOCKS5 auth, connection limits, and sanitized /proxy.pac.
+- Flexible IP/port controls with random port generator and hot restart.
+- Light, Dark, AMOLED Black, and Material You themes.
+- Granular notifications with live speed, privacy mode, and alerts.
+- New Mesh-Node adaptive & monochrome icon and OEM compatibility diagnostics.

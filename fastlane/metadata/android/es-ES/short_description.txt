@@ -1,0 +1,1 @@
+Router Wi-Fi Direct sin root, proxy multiprotocolo y cliente VPN SOCKS5
