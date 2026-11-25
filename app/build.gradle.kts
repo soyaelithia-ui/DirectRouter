@@ -1,7 +1,39 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+val keystoreProperties = Properties().apply {
+    val file = rootProject.file("keystore.properties")
+    if (file.isFile) {
+        file.inputStream().use { load(it) }
+    }
+}
+
+fun signingValue(vararg envNames: String, propName: String): String? {
+    for (envName in envNames) {
+        val value = System.getenv(envName)?.trim()
+        if (!value.isNullOrEmpty()) return value
+    }
+    return keystoreProperties.getProperty(propName)?.trim()?.takeIf { it.isNotEmpty() }
+}
+
+val releaseStorePath = signingValue("DIRECTROUTER_KEYSTORE_PATH", "KEYSTORE_PATH", "KEYSTORE_FILE", propName = "storeFile")
+val releaseStorePassword = signingValue("DIRECTROUTER_KEYSTORE_PASSWORD", "KEYSTORE_PASSWORD", propName = "storePassword")
+val releaseKeyAlias = signingValue("DIRECTROUTER_KEY_ALIAS", "KEY_ALIAS", propName = "keyAlias")
+val releaseKeyPassword = signingValue("DIRECTROUTER_KEY_PASSWORD", "KEY_PASSWORD", propName = "keyPassword")
+val releaseStoreFile = releaseStorePath?.let { rootProject.file(it) }
+val hasReleaseSigning = releaseStoreFile != null &&
+    releaseStoreFile.isFile &&
+    !releaseStorePassword.isNullOrEmpty() &&
+    !releaseKeyAlias.isNullOrEmpty() &&
+    !releaseKeyPassword.isNullOrEmpty()
+
+if (releaseStorePath != null && (releaseStoreFile == null || !releaseStoreFile.isFile)) {
+    logger.warn("Release keystore file not found at '$releaseStorePath'; release APK will be built unsigned.")
 }
 
 android {
@@ -21,6 +53,20 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = releaseStoreFile
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -28,7 +74,16 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
+    }
+
+    dependenciesInfo {
+        // Disables Google dependency metadata block in APK/AAB (required by IzzyOnDroid & F-Droid)
+        includeInApk = false
+        includeInBundle = false
     }
 
     compileOptions {

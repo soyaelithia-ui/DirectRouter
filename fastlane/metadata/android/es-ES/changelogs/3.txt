@@ -1,0 +1,5 @@
+- Endurecimiento de seguridad: enlace local seguro por defecto, Anti-SSRF (TCP/UDP), autenticación opcional HTTP Basic/SOCKS5, límite de conexiones y /proxy.pac sanitizado.
+- Control de IP/puerto con generador de puerto aleatorio y reinicio en caliente.
+- Temas Claro, Oscuro, Negro AMOLED y Material You.
+- Notificaciones con velocidad en vivo, modo privacidad y alertas.
+- Nuevo icono adaptativo Mesh-Node y diagnóstico OEM integrado.
